@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Ben Manes. All Rights Reserved.
+ * Copyright 2020 Ben Manes. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,6 @@
  */
 package com.github.benmanes.caffeine.cache.simulator.policy.irr;
 
-import static com.google.common.base.Preconditions.checkState;
-
-import java.util.Set;
-
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
@@ -27,29 +23,51 @@ import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.primitives.Ints;
 import com.typesafe.config.Config;
-
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.Set;
+
+import static com.google.common.base.Preconditions.checkState;
+
 /**
- * The ClockPro algorithm. This algorithm differs from LIRS by replacing the LRU stacks with Clock
- * (Second Chance) policy. This allows cache hits to be performed concurrently at the cost of a
- * global lock on a miss and a worst case O(n) eviction when the queue is scanned.
- * <p>
- * ClockPro uses three hands that scan the queue. The hot hand points to the largest recency, the
- * cold hand to the cold entry furthest from the hot hand, and the test hand to the last cold entry
- * in the test period. This policy is adaptive by adjusting the percentage of hot and cold entries
- * that may reside in the cache. It uses non-resident (ghost) entries to retain additional history,
- * which are removed during the test hand's scan. The algorithm is explained by the authors in
- * <a href="http://www.ece.eng.wayne.edu/~sjiang/pubs/papers/jiang05_CLOCK-Pro.pdf">CLOCK-Pro: An
- * Effective Improvement of the CLOCK Replacement</a> and
- * <a href="http://www.slideshare.net/huliang64/clockpro">Clock-Pro: An Effective Replacement in OS
- * Kernel</a>.
+ * The ClockProPlus algorithm. This algorithm differs from ClockPro by adjusting the coldTarget
+ * with the utility-driven adaption idea borrowed from CAR. The algorithm is explained by the
+ * authors in <a href="https://dl.acm.org/doi/10.1145/3319647.3325838">CLOCK-Pro+: improving
+ * CLOCK-Pro cache replacement with utility-driven adaptation</a>.
+ *
+ * Implementation here differs from ClockProPolicy only in adjusting coldTarget and tracking for
+ * demoted status part. Below is a summarize of coldTarget adjusting differences between ClockPro
+ * and ClockPro+.
+ * +-----------------------------------------------------------------------------------+
+ * |                  ClockPro ColdTarget Adaption Algorithm Summary                   |
+ * +------+----------+-----------------------------------------------------------------+
+ * | When | increase |                                     access in test period pages |
+ * |      | decrease |                           test period is expired without access |
+ * +------+----------+-----------------------------------------------------------------+
+ * | Size | increase |                                                              +1 |
+ * |      | decrease |                                                              -1 |
+ * +------+----------+-----------------------------------------------------------------+
+ * |                  ClockPro+ ColdTarget Adaption Algorithm Summary                  |
+ * +------+----------+-----------------------------------------------------------------+
+ * | When | increase |                                    access in non-resident pages |
+ * |      | decrease |                                access in demoted from hot pages |
+ * |      |          |  * Note: demoted from hot pages ⊂ resident cold but not in test |
+ * +------+----------+-----------------------------------------------------------------+
+ * | Size | increase |         d = (demoted size / non-resident size); d < 1 ? +1 : +d |
+ * |      | decrease |         d = (non-resident size / demoted size); d < 1 ? -1 : -d |
+ * +------+----------+-----------------------------------------------------------------+
+ *
+ * This algorithm uses non-resident cold entries size to calculate adaption size so changing
+ * non-resident-multiplier may affect the adaption algorithm. In the author's research code
+ * percent-max-resident-cold was set to 0.5x.
  *
  * @author ben.manes@gmail.com (Ben Manes)
  * @author park910113@gmail.com (Chanyoung Park)
  */
-public final class ClockProTestPolicy implements KeyOnlyPolicy {
+public final class ClockProPlusPlusPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
 
@@ -72,15 +90,6 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
   // list.
   private Node handTest;
 
-  static final double RESTART_THRESHOLD = 0.05d;
-  static final double STEP_DECAY_RATE = 0.98d;
-  static final double STEP_PERCENT = 0.0625d;
-
-  private long hitCount;
-  private long missCount;
-  private double previousHitRate;
-  private double stepSize;
-
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
   private final int maxNonResSize;
@@ -90,19 +99,40 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
   private int sizeNonResCold;
   private int sizeInTest;
   private int sizeFree;
+  private int sizeDemoted;
 
   // Target number of resident cold pages (adaptive):
-  //  - increases when test page gets a hit
-  //  - decreases when test page is removed
+  //  - increases when non-resident page gets a hit
+  //  - decreases when demoted cold page gets a hit
   private int coldTarget;
   // {min,max}ResColdSize are boundary of coldTarget.
   private int minResColdSize;
   private int maxResColdSize;
 
+  private final int CPP_MODE_THRESHOLD;
+
+  private enum AdpationMode {
+    DUAL(/* CP */ true, /* CP+ */ true),
+    CP (true, false),
+    CP_PLUS (false, true);
+
+    AdpationMode(boolean cp, boolean cpp) {
+      this.cp = cp;
+      this.cpp = cpp;
+    }
+
+    public boolean useCP() { return cp; }
+    public boolean useCPP() { return cpp; }
+
+    private final boolean cp;
+    private final boolean cpp;
+  };
+  private AdpationMode adpationMode = AdpationMode.DUAL;
+
   // Enable to print out the internal state
   static final boolean debug = false;
 
-  public ClockProTestPolicy(Config config) {
+  public ClockProPlusPlusPolicy(Config config) {
     ClockProSettings settings = new ClockProSettings(config);
     this.maxSize = Ints.checkedCast(settings.maximumSize());
     this.maxNonResSize = (int) (maxSize * settings.nonResidentMultiplier());
@@ -114,22 +144,21 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (maxResColdSize > maxSize - minResColdSize) {
       maxResColdSize = maxSize - minResColdSize;
     }
-    this.policyStats = new PolicyStats("irr.ClockProTest");
+    this.policyStats = new PolicyStats("irr.ClockProPlusPlus");
     this.data = new Long2ObjectOpenHashMap<>();
     this.coldTarget = minResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
-
-    this.stepSize = (STEP_PERCENT * maxSize);
-
     checkState(minResColdSize <= maxResColdSize);
+
+    CPP_MODE_THRESHOLD = Math.min(maxSize, maxNonResSize / 3 * 2);
   }
 
   /**
    * Returns all variations of this policy based on the configuration parameters.
    */
   public static Set<Policy> policies(Config config) {
-    return ImmutableSet.of(new ClockProTestPolicy(config));
+    return ImmutableSet.of(new ClockProPlusPlusPolicy(config));
   }
 
   @Override
@@ -167,7 +196,6 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
 
   private void onHit(Node node) {
     policyStats.recordHit();
-    hitCount++;
     node.marked = true;
   }
 
@@ -176,14 +204,11 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-    missCount++;
-
     if (sizeFree > minResColdSize) {
       onHotWarmupMiss(node);
     } else if (sizeFree > 0) {
       onColdWarmupMiss(node);
     } else {
-      coldTargetAdjust(1);
       onFullMiss(node);
     }
     organizeHands();
@@ -207,6 +232,20 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       onOutOfClockFullMiss(node);
     } else {
       throw new IllegalStateException();
+    }
+    shiftMode();
+  }
+
+  private void shiftMode() {
+    if (sizeNonResCold > CPP_MODE_THRESHOLD) {
+      // As the total number of NRs increases, we can expect the number of NRs that handHot
+      // encounters to increase as well. This can make it difficult for the coldTarget grows quickly
+      // when workloads are changed from time to time. However, since the CP+'s coldTarget is not
+      // affected by the terminating of NR pages, the CP+ algorithm can react more agilely than CP
+      // in a situation where there are many NRs.
+      adpationMode = AdpationMode.CP_PLUS;
+    } else {
+      adpationMode = AdpationMode.DUAL;
     }
   }
 
@@ -246,8 +285,14 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (!candidate.isInClock() || !candidate.isInTest()) {
       return false;
     }
-    // This candidate cold page is accessed during its test period, so we increment coldTarget by 1.
-    //coldTargetAdjust(+1);
+    if (adpationMode.useCPP() && !candidate.isResident()) {
+      // If an access on a non-resident cold page then increment coldTarget.
+      coldTargetAdjust(true);
+    }
+    if (adpationMode.useCP()) {
+      // This candidate cold page is accessed during its test period, so we increment coldTarget by 1.
+      coldTargetAdjust(+1);
+    }
     while (sizeHot >= maxSize - coldTarget) {
       // handHot has passed the candidate and terminates its test period. Reject the promotion.
       if (!candidate.isInTest()) {
@@ -278,6 +323,14 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
           handCold.moveToHead(Status.COLD_RES_IN_TEST);
         }
       } else {
+        if (handCold.demoted) {
+          if (adpationMode.useCPP()) {
+            // Decrease cold target when observing the reference bit set on a demoted cold page.
+            coldTargetAdjust(false);
+          }
+          handCold.demoted = false;
+          sizeDemoted--;
+        }
         handCold.moveToHead(Status.COLD_RES_IN_TEST);
       }
     } else {
@@ -289,6 +342,10 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
         handCold.setStatus(Status.COLD_NON_RES);
         handCold = handCold.prev;
       } else {
+        if (handCold.demoted) {
+          handCold.demoted = false;
+          sizeDemoted--;
+        }
         handCold.removeFromClock();
       }
       // We keep track the number of non-resident cold pages. Once the number exceeds the limit, we
@@ -323,11 +380,21 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
         if (handHot.marked) {
           handHot.moveToHead(Status.HOT);
         } else {
+          handHot.demoted = true;
+          sizeDemoted++;
           handHot.moveToHead(Status.COLD_RES);
           demoted = true;
           break;
         }
       } else {
+        if (handHot.marked && handHot.demoted) {
+          if (adpationMode.useCPP()) {
+            // Decrease cold target when observing the reference bit set on a demoted cold page.
+            coldTargetAdjust(false);
+          }
+          handHot.demoted = false;
+          sizeDemoted--;
+        }
         // Whenever the hand encounters a cold page, it will terminate the page’s test period. The
         // hand will also remove the cold page from the clock if it is non-resident (the most
         // probable case). It actually does the work on the cold page on behalf of handTest.
@@ -356,12 +423,16 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (node.isResidentCold()) {
       node.setStatus(Status.COLD_RES);
     } else {
+      // Demoted node can't be in a test period.
+      checkState(!node.demoted);
       node.removeFromClock();
     }
-    // If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
-    // page passes its test period without a re-access, we decrement coldTarget by 1. Note the
-    // aforementioned cold pages include resident and non-resident cold pages.
-    //coldTargetAdjust(node.marked ? +1 : -1);
+    if (adpationMode.useCP()) {
+      // If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
+      // page passes its test period without a re-access, we decrement coldTarget by 1. Note the
+      // aforementioned cold pages include resident and non-resident cold pages.
+      coldTargetAdjust(node.marked ? +1 : -1);
+    }
   }
 
   // Make handCold points to the resident cold page with the largest recency.
@@ -416,39 +487,33 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     nextHandTest();
   }
 
-  private void determineNextStepSize() {
-    double hitRateInSample = (double) hitCount / (hitCount + missCount);
-    double hitRateChange = hitRateInSample - previousHitRate;
-
-    if (Math.abs(hitRateChange) >= RESTART_THRESHOLD) {
-      stepSize = STEP_PERCENT * maxSize;
+  private void coldTargetAdjust(boolean increase) {
+    int delta = 0;
+    if (increase) {
+      if (sizeNonResCold != 0) {
+        delta = sizeDemoted / sizeNonResCold;
+      }
     } else {
-      stepSize = STEP_DECAY_RATE * maxSize;
+      if (sizeDemoted != 0) {
+        delta = sizeNonResCold / sizeDemoted;
+      }
     }
-    if (hitRateChange < 0) {
-      stepSize = -stepSize;
+    if (delta < 1) {
+      delta = 1;
     }
-
-    previousHitRate = hitRateInSample;
-    hitCount = missCount = 0;
+    if (!increase) {
+      delta = delta * -1;
+    }
+    coldTargetAdjust(delta);
   }
 
-  private void _coldTargetAdjust(int n) {
+  private void coldTargetAdjust(int n) {
     coldTarget += n;
     if (coldTarget < minResColdSize) {
       coldTarget = minResColdSize;
     } else if (coldTarget > maxResColdSize) {
       coldTarget = maxResColdSize;
     }
-  }
-
-  private void coldTargetAdjust(int n) {
-    if ((hitCount + missCount) < 1 * maxSize) {
-      return;
-    }
-    //System.out.println(stepSize);
-    _coldTargetAdjust((int) stepSize);
-    determineNextStepSize();
   }
 
   private void validateClockStructure() {
@@ -491,7 +556,8 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     int sizeResCold;
     int sizeNonResCold;
     int sizeInTest;
-    sizeHot = sizeInTest = sizeResCold = sizeNonResCold = 0;
+    int sizeRecentlyDemoted;
+    sizeHot = sizeInTest = sizeResCold = sizeNonResCold = sizeRecentlyDemoted = 0;
 
     Node node = listHead;
     do {
@@ -511,6 +577,9 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       if (node.isInTest()) {
         sizeInTest++;
       }
+      if (node.demoted) {
+        sizeRecentlyDemoted++;
+      }
       node = node.next;
     } while (node != listHead);
 
@@ -518,6 +587,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     checkState(sizeNonResCold == this.sizeNonResCold);
     checkState(sizeInTest == this.sizeInTest);
     checkState(sizeResCold == this.sizeResCold);
+    checkState(sizeRecentlyDemoted == this.sizeDemoted);
     checkState(sizeHot + sizeResCold == maxSize - sizeFree);
     checkState(sizeResCold + sizeFree >= minResColdSize);
     checkState(sizeResCold <= maxResColdSize);
@@ -553,6 +623,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     Node next;
 
     boolean marked;
+    boolean demoted;
 
     public Node(long key) {
       this.key = key;
@@ -634,6 +705,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       StringBuilder sb = new StringBuilder(MoreObjects.toStringHelper(this)
           .add("key", key)
           .add("marked", marked)
+          .add("demoted", demoted)
           .add("type", status)
           .toString());
       if (this == handHot) {
