@@ -177,6 +177,8 @@ public final class Registry {
     factories.put("irr.ClockProPlusPlus", ClockProPlusPlusPolicy::policies);
     factories.put("irr.ClockProHalfPlus", ClockProHalfPlusPolicy::policies);
     factories.put("irr.GClockPro", GClockProPolicy::policies);
+    factories.put("irr.ClockProPPHC", ClockProPPHCPolicy::policies);
+    factories.put("irr.ClockProHC", ClockProHCPolicy::policies);
 
     factories.put("irr.DClock", DClockPolicy::policies);
   }
