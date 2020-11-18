@@ -227,7 +227,12 @@ public final class ClockProHalfPlusPolicy implements KeyOnlyPolicy {
     // accessed node when the runHandHot failed to find a non-accessed hot node between the handHot
     // and the accessed cold node.
     evict();
-    if (canPromote(node)) {
+    boolean canPromote = canPromote(node);
+    if (!node.isInClock()) {
+      // node is removed from data while evicting or demoting.
+      data.put(node.key, node);
+    }
+    if (canPromote) {
       node.moveToHead(Status.HOT);
     } else {
       node.moveToHead(Status.COLD_RES_IN_TEST);
@@ -300,11 +305,13 @@ public final class ClockProHalfPlusPolicy implements KeyOnlyPolicy {
         handCold.setStatus(Status.COLD_NON_RES);
         handCold = handCold.prev;
       } else {
-        if (handCold.demoted) {
-          handCold.demoted = false;
+        Node node = handCold;
+        if (node.demoted) {
+          node.demoted = false;
           sizeDemoted--;
         }
-        handCold.removeFromClock();
+        node.removeFromClock();
+        data.remove(node.key);
       }
       // We keep track the number of non-resident cold pages. Once the number exceeds the limit, we
       // terminate the test period of the cold page pointed to by handTest.
@@ -373,6 +380,11 @@ public final class ClockProHalfPlusPolicy implements KeyOnlyPolicy {
     if (!node.isInTest()) {
       return;
     }
+    // If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
+    // page passes its test period without a re-access, we decrement coldTarget by 1. Note the
+    // aforementioned cold pages include resident and non-resident cold pages.
+    coldTargetAdjust(node.marked ? +1 : -1);
+
     // We terminate the test period of the cold page, and also remove it from the clock if it is a
     // non-resident page. Because the cold page has used up its test period without a re-access and
     // has no chance to turn into a hot page with its next access.
@@ -382,11 +394,8 @@ public final class ClockProHalfPlusPolicy implements KeyOnlyPolicy {
       // Demoted node can't be in a test period.
       checkState(!node.demoted);
       node.removeFromClock();
+      data.remove(node.key);
     }
-    // If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
-    // page passes its test period without a re-access, we decrement coldTarget by 1. Note the
-    // aforementioned cold pages include resident and non-resident cold pages.
-    coldTargetAdjust(node.marked ? +1 : -1);
   }
 
   // Make handCold points to the resident cold page with the largest recency.
