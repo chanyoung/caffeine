@@ -181,6 +181,7 @@ public final class Registry {
     factories.put("irr.ClockProHC", ClockProHCPolicy::policies);
     factories.put("irr.ClockProPPP", ClockProPPPPolicy::policies);
     factories.put("irr.ClockProPPPHC", ClockProPPPHCPolicy::policies);
+    factories.put("irr.WorkloadAnalyzer", WorkloadAnalyzer::policies);
 
     factories.put("irr.DClock", DClockPolicy::policies);
   }
