@@ -16,6 +16,7 @@
 package com.github.benmanes.caffeine.cache.simulator.policy.irr;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.membership.Membership;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
@@ -26,8 +27,10 @@ import com.typesafe.config.Config;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
+import java.util.Arrays;
 import java.util.Set;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 
 /**
@@ -61,7 +64,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
-  private final int maxNonResSize;
 
   private int sizeHot;
   private int sizeResCold;
@@ -80,10 +82,16 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   // Enable to print out the internal state
   static final boolean debug = false;
 
+  private SimpleDecayBloomFilter filter;
+
+  private int decayThreshold;
+  private int decayTime;
+
+  private int[] lives = new int[Byte.SIZE + 1];
+
   public ClockProNewPolicy(Config config) {
     ClockProSettings settings = new ClockProSettings(config);
     this.maxSize = Ints.checkedCast(settings.maximumSize());
-    this.maxNonResSize = (int) (maxSize * settings.nonResidentMultiplier());
     this.minResColdSize = (int) (maxSize * settings.percentMinCold());
     if (minResColdSize < settings.lowerBoundCold()) {
       minResColdSize = settings.lowerBoundCold();
@@ -97,6 +105,8 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     this.coldTarget = minResColdSize;
     this.listHead = this.hand = null;
     this.sizeFree = maxSize;
+
+    filter = new SimpleDecayBloomFilter(maxSize * 5, 0.001, 4);
     checkState(minResColdSize <= maxResColdSize);
   }
 
@@ -117,6 +127,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     if (debug) {
       printClock();
     }
+    Arrays.stream(lives).forEach(System.out::println);
   }
 
   @Override
@@ -127,10 +138,8 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       node = new Node(key);
       data.put(key, node);
       onMiss(node);
-    } else if (node.isResident()) {
-      onHit(node);
     } else {
-      onMiss(node);
+      onHit(node);
     }
   }
 
@@ -150,44 +159,182 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     }
   }
 
+  private void remove(Node node) {
+    if (node == hand) {
+      nextHand();
+    }
+    node.unlink();
+    filter.put(node.key);
+    data.remove(node.key);
+  }
+
+  private void moveToHead(Node node) {
+    if (node == hand) {
+      nextHand();
+    }
+    node.unlink();
+    if (listHead != null) {
+      node.linkTo(listHead);
+    }
+    listHead = node;
+  }
+
+  private void nextHand() {
+    checkState(hand != null);
+    if (hand == listHead) {
+      hand = null;
+    } else {
+      hand = hand.prev;
+    }
+  }
+
   /** Records a miss when the hot set is not full. */
   private void onHotWarmupMiss(Node node) {
-    node.moveToHead(Status.HOT_SHORT_IRR);
+    moveToHead(node);
+    node.setStatus(Status.HOT_SHORT_IRR);
   }
 
   /** Records a miss when the cold set is not full. */
   private void onColdWarmupMiss(Node node) {
-    node.moveToHead(Status.COLD_RES_SHORT_IRR);
+    moveToHead(node);
+    node.setStatus(Status.COLD_SHORT_IRR);
+    if (hand == null) {
+      hand = node;
+    }
   }
 
   /** Records a miss when the hot and cold set are full. */
   private void onFullMiss(Node node) {
-    if (node.status == Status.COLD_NON_RES) {
+    checkState(node.status == Status.OUT_OF_CLOCK);
+    int life = filter.mightContain2(node.key);
+    int index = 0;
+    while (life != 0) {
+      index++;
+      life = life >>> 1;
+    }
+    lives[index]++;
+
+//    if (index > 0) {
+//      if (index == 4) {
+//        onOutOfClockFullMiss(node);
+//      } else {
+//        onNonResidentFullMiss(node);
+//      }
+//    } else {
+//      onOutOfClockFullMiss(node);
+//    }
+
+    if (filter.mightContain(node.key)) {
       onNonResidentFullMiss(node);
-    } else if (node.status == Status.OUT_OF_CLOCK) {
-      onOutOfClockFullMiss(node);
     } else {
-      throw new IllegalStateException();
+      onOutOfClockFullMiss(node);
     }
   }
 
   private void onOutOfClockFullMiss(Node node) {
     evict();
-    node.moveToHead(Status.COLD_RES_SHORT_IRR);
+    moveToHead(node);
+    node.setStatus(Status.COLD_SHORT_IRR);
   }
 
   private void onNonResidentFullMiss(Node node) {
     evict();
-    node.moveToHead(Status.COLD_RES_SHORT_IRR);
+    if (canPromote(node)) {
+      if (filter.mightContain(node.key)) {
+        moveToHead(node);
+        node.setStatus(Status.HOT_SHORT_IRR);
+      } else {
+        moveToHead(node);
+        node.setStatus(Status.COLD_SHORT_IRR);
+      }
+    } else {
+      moveToHead(node);
+      node.setStatus(Status.COLD_SHORT_IRR);
+    }
   }
 
   private void evict() {
     policyStats.recordEviction();
-    checkState(sizeFree == 0);
-    Node node = listHead.prev;
-    node.removeFromClock();
-    data.remove(node.key);
-    checkState(sizeFree == 1);
+    while (sizeFree == 0) {
+      runHand();
+    }
+  }
+
+  private void coldTargetAdjust(int n) {
+    coldTarget += n;
+    if (coldTarget < minResColdSize) {
+      coldTarget = minResColdSize;
+    } else if (coldTarget > maxResColdSize) {
+      coldTarget = maxResColdSize;
+    }
+  }
+
+  private void runHand() {
+    checkState(hand != listHead);
+    Node node = hand;
+    if (node.marked) {
+      if (node.isShortIrr()) {
+        coldTargetAdjust(+1);
+      } else {
+        coldTargetAdjust(-1);
+      }
+
+      if (canPromote(node)) {
+        moveToHead(node);
+        node.setStatus(Status.HOT_SHORT_IRR);
+      } else {
+        moveToHead(node);
+        node.setStatus(Status.COLD_SHORT_IRR);
+      }
+    } else {
+      if (node.isCold()) {
+        remove(node);
+      } else {
+        nextHand();
+      }
+    }
+  }
+
+  private boolean canPromote(Node candidate) {
+    if (sizeHot >= maxSize - coldTarget) {
+//    while (sizeHot >= maxSize - coldTarget) {
+      if (demoteHot()) {
+        if (candidate.status == Status.OUT_OF_CLOCK && !filter.mightContain(candidate.key)) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private boolean demoteHot() {
+    for (Node node = listHead.prev; node != hand; node = node.prev) {
+      checkState(node.isHot());
+
+      if (node.marked) {
+        if (node.isShortIrr()) {
+          coldTargetAdjust(+1);
+        } else {
+          coldTargetAdjust(-1);
+        }
+        moveToHead(node);
+        node.setStatus(Status.HOT_LONG_IRR);
+      } else {
+        moveToHead(node);
+        node.setStatus(Status.COLD_LONG_IRR);
+        return true;
+      }
+
+      decayTime++;
+      if (decayTime > decayThreshold) {
+        filter.decay();
+        decayThreshold = sizeHot / 8;
+        decayTime = 0;
+      }
+    }
+    return false;
   }
 
   /** Prints out the internal state of the policy. */
@@ -201,9 +348,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   enum Status {
-    HOT_LONG_IRR, HOT_SHORT_IRR,
-    COLD_RES_LONG_IRR, COLD_RES_SHORT_IRR,
-    COLD_NON_RES, OUT_OF_CLOCK,
+    HOT_LONG_IRR, HOT_SHORT_IRR, COLD_LONG_IRR, COLD_SHORT_IRR, OUT_OF_CLOCK,
   }
 
   final class Node {
@@ -221,61 +366,38 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       status = Status.OUT_OF_CLOCK;
     }
 
-    public void moveToHead(Status status) {
-      if (isInClock()) {
-        removeFromClock();
-      }
-      if (listHead == null) {
-        next = prev = this;
-      } else {
-        next = listHead;
-        prev = listHead.prev;
-        listHead.prev.next = this;
-        listHead.prev = this;
-      }
-      setStatus(status);
-      listHead = this;
+    public void linkTo(Node node) {
+      next = node;
+      prev = node.prev;
+      node.prev.next = this;
+      node.prev = this;
     }
 
-    public void removeFromClock() {
-      if (this == listHead) {
-        listHead = listHead.next;
-      }
-      if (this == hand) {
-        hand = hand.prev;
-      }
+    public void unlink() {
       prev.next = next;
       next.prev = prev;
       prev = next = this;
-      setStatus(Status.OUT_OF_CLOCK);
       marked = false;
+      setStatus(Status.OUT_OF_CLOCK);
     }
 
     public void setStatus(Status status) {
-      if (this.isResident()) { sizeFree++; }
+      if (this.isInClock()) { sizeFree++; }
       if (this.isShortIrr()) { sizeShortIrr--; }
-      if (this.isResidentCold()) { sizeResCold--; }
-      if (this.status == Status.COLD_NON_RES) { sizeNonResCold--; }
+      if (this.isCold()) { sizeResCold--; }
       if (this.isHot()) { sizeHot--; }
       this.status = status;
-      if (this.isResident()) { sizeFree--; }
+      if (this.isInClock()) { sizeFree--; }
       if (this.isShortIrr()) { sizeShortIrr++; }
-      if (this.isResidentCold()) { sizeResCold++; }
-      if (this.status == Status.COLD_NON_RES) { sizeNonResCold++; }
+      if (this.isCold()) { sizeResCold++; }
       if (this.isHot()) { sizeHot++; }
     }
 
     boolean isShortIrr() {
-      return status == Status.COLD_RES_SHORT_IRR || status == Status.HOT_SHORT_IRR;
-    }
-    boolean isResident() {
-      return isResidentCold() || isHot();
-    }
-    boolean isResidentCold() {
-      return status == Status.COLD_RES_LONG_IRR || status == Status.COLD_RES_SHORT_IRR;
+      return status == Status.COLD_SHORT_IRR || status == Status.HOT_SHORT_IRR;
     }
     boolean isCold() {
-      return isResidentCold() || status == Status.COLD_NON_RES;
+      return status == Status.COLD_LONG_IRR || status == Status.COLD_SHORT_IRR;
     }
     boolean isHot() {
       return status == Status.HOT_LONG_IRR || status == Status.HOT_SHORT_IRR;
@@ -295,6 +417,133 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         sb.append(" <--[ HAND ]");
       }
       return sb.toString();
+    }
+  }
+
+  /**
+   * Based on com/github/benmanes/caffeine/cache/simulator/membership/bloom/BloomFilter.java
+   */
+  static final class SimpleDecayBloomFilter implements Membership {
+
+    static final long[] SEED = { // A mixture of seeds from FNV-1a, CityHash, and Murmur3
+            0xc3a5c85c97cb3127L, 0xb492b66fbe98f273L, 0x9ae16a3b2f90404fL, 0xcbf29ce484222325L};
+
+    int tableSize;
+    byte[] table;
+    byte fullLifeTime;
+
+    /**
+     * Creates a membership sketch based on the expected number of insertions and the false positive
+     * probability.
+     */
+    public SimpleDecayBloomFilter(long expectedInsertions, double fpp, int lifetime) {
+      checkArgument(lifetime > 0 && lifetime <= Byte.SIZE);
+      tableSize = optimalSize(expectedInsertions, fpp);
+      table = new byte[tableSize];
+      fullLifeTime = (byte) (1 << (lifetime - 1));
+    }
+
+    /**
+     * Calc optimal size.
+     *
+     * @param expectedInsertions the number of expected insertions
+     * @param fpp the false positive probability, where 0.0 > fpp < 1.0
+     */
+    int optimalSize(long expectedInsertions, double fpp) {
+      checkArgument(expectedInsertions >= 0);
+      checkArgument(fpp > 0 && fpp < 1);
+
+      double optimalBitsFactor = -Math.log(fpp) / (Math.log(2) * Math.log(2));
+      return (int) (expectedInsertions * optimalBitsFactor);
+    }
+
+    @Override
+    public boolean mightContain(long e) {
+      int item = spread(Long.hashCode(e));
+      for (int i = 0; i < 4; i++) {
+        int hash = seeded(item, i);
+        int index = Math.abs(hash % tableSize);
+        if ((table[index]) == 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    public int mightContain2(long e) {
+      int life = Integer.MAX_VALUE;
+      int item = spread(Long.hashCode(e));
+      for (int i = 0; i < 4; i++) {
+        int hash = seeded(item, i);
+        int index = Math.abs(hash % tableSize);
+        if ((table[index]) == 0) {
+          return 0;
+        }
+        if (life > table[index]) {
+          life = table[index];
+        }
+      }
+      return life;
+    }
+
+    @Override
+    public void clear() {
+      byte zero = (byte) 0;
+      Arrays.fill(table, zero);
+    }
+
+    @Override
+    @SuppressWarnings("ShortCircuitBoolean")
+    public boolean put(long e) {
+      int item = spread(Long.hashCode(e));
+      return setAt(item, 0) | setAt(item, 1) | setAt(item, 2) | setAt(item, 3);
+    }
+
+    public void decay() {
+      for (int i = 0; i < tableSize; i++) {
+        table[i] = (byte) (table[i] >>> 1);
+      }
+    }
+
+    /**
+     * Sets the membership flag for the computed bit location.
+     *
+     * @param item the element's hash
+     * @param seedIndex the hash seed index
+     * @return if the membership changed as a result of this operation
+     */
+    @SuppressWarnings("PMD.LinguisticNaming")
+    boolean setAt(int item, int seedIndex) {
+      int hash = seeded(item, seedIndex);
+      int index = Math.abs(hash % tableSize);
+      if (table[index] == fullLifeTime) {
+        return true;
+      }
+      table[index] = fullLifeTime;
+      return false;
+    }
+
+    /**
+     * Applies a supplemental hash function to a given hashCode, which defends against poor quality
+     * hash functions.
+     */
+    int spread(int x) {
+      x = ((x >>> 16) ^ x) * 0x45d9f3b;
+      x = ((x >>> 16) ^ x) * 0x45d9f3b;
+      return (x >>> 16) ^ x;
+    }
+
+    /**
+     * Applies the independent hash function for the given seed index.
+     *
+     * @param item the element's hash
+     * @param i the hash seed index
+     * @return the table index
+     */
+    static int seeded(int item, int i) {
+      long hash = (item + SEED[i]) * SEED[i];
+      hash += hash >>> 32;
+      return (int) hash;
     }
   }
 
