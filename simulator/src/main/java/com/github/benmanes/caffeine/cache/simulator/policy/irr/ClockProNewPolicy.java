@@ -106,9 +106,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     checkState(minResColdSize <= maxResColdSize);
 
     this.decayThreshold = maximumSize;
-    this.decayIrrThreshold = 7;
-    this.decayMaxLife = 7;
-    filter = new SimpleDecayBloomFilter(maximumSize * 5, 0.001, decayMaxLife);
+    this.decayIrrThreshold = 8;
+    this.decayMaxLife = 8;
+    filter = new SimpleDecayBloomFilter(maximumSize * decayMaxLife, 0.001, decayMaxLife);
 
     lifelimit = maximumSize;
   }
@@ -273,53 +273,39 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   private void onFullMiss(Node node) {
     checkState(node.status == Status.OUT_OF_CLOCK);
 
-    int life = filter.mightContain2(node.key);
-    int index = 0;
-    while (life != 0) {
-      index++;
-      life = life >>> 1;
+    int val = filter.mightContain2(node.key);
+    int freshness = 0; // [Not exist] 0 - [Old] 1 - 2 ... - 7 - 8 [Fresh]
+    while (val != 0) {
+      freshness++;
+      val >>>= 1;
     }
-    lives[index]++;
+    lives[freshness]++;
 
-    if (index > 0) {
-      if (index == decayMaxLife) {
-        in++;
-        coldTargetAdjust(+1);
-      } else {
-        out++;
-        coldTargetAdjust(-1);
-      }
+    if (freshness == 0) {
+      onOutOfClockFullMiss(node);
+      return;
+    }
 
-      // Loop problem. ..
-      // Fix decayIrrThreshold -> decayIrrThreshold + 1
-      if (index >= decayIrrThreshold) {
-//        in++;
-//        coldTargetAdjust(+1);
-        if (index == decayIrrThreshold) {
-          if (lifelimit > 0) {
-            onNonResidentFullMiss(node);
-            lifelimit--;
-          } else {
-            onOutOfClockFullMiss(node);
-          }
-        } else {
-          onNonResidentFullMiss(node);
-        }
+    if (freshness == decayMaxLife) {
+      in++;
+      coldTargetAdjust(+1);
+    } else {
+      out++;
+      coldTargetAdjust(-1);
+    }
+
+    if (freshness > decayIrrThreshold) {
+      onNonResidentFullMiss(node);
+    } else if (freshness == decayIrrThreshold) {
+      if (lifelimit > 0) {
+        onNonResidentFullMiss(node);
+        lifelimit--;
       } else {
-//        out++;
-//        coldTargetAdjust(-1);
         onOutOfClockFullMiss(node);
       }
     } else {
       onOutOfClockFullMiss(node);
     }
-
-//    if (filter.mightContain(node.key)) {
-//      onNonResidentFullMiss(node);
-//      throw new IllegalStateException();
-//    } else {
-//      onOutOfClockFullMiss(node);
-//    }
   }
 
   private void onOutOfClockFullMiss(Node node) {
@@ -330,50 +316,16 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void onNonResidentFullMiss(Node node) {
     evict();
-    if (sizeHot < maximumSize - coldTarget) {
+    if (sizeHot >= hotTarget()) {
+      demoteHot();
+    }
+    if (sizeHot < hotTarget()) {
       moveToHead(node);
       node.setStatus(Status.HOT_SHORT_IRR);
     } else {
-      if (demoteHot()) {
-        moveToHead(node);
-        node.setStatus(Status.HOT_SHORT_IRR);
-      } else {
-        moveToHead(node);
-        node.setStatus(Status.COLD_SHORT_IRR);
-      }
+      moveToHead(node);
+      node.setStatus(Status.COLD_SHORT_IRR);
     }
-//    if (sizeHot >= maxSize - coldTarget) {
-//      demoteHot();
-//    }
-//    if (sizeHot < maxSize - coldTarget) {
-//      moveToHead(node);
-//      node.setStatus(Status.HOT_SHORT_IRR);
-//    } else {
-//      moveToHead(node);
-//      node.setStatus(Status.COLD_SHORT_IRR);
-//    }
-
-//    evict();
-//    if (canPromote()) {
-//      int life = filter.mightContain2(node.key);
-//      int index = 0;
-//      while (life != 0) {
-//        index++;
-//        life = life >>> 1;
-//      }
-//      lives[index]++;
-//
-//      if (index >= decayIrrThreshold) {
-//        moveToHead(node);
-//        node.setStatus(Status.HOT_SHORT_IRR);
-//      } else {
-//        moveToHead(node);
-//        node.setStatus(Status.COLD_SHORT_IRR);
-//      }
-//    } else {
-//      moveToHead(node);
-//      node.setStatus(Status.COLD_SHORT_IRR);
-//    }
   }
 
   private void evict() {
@@ -545,9 +497,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     boolean isHot() {
       return status == Status.HOT_LONG_IRR || status == Status.HOT_SHORT_IRR;
     }
-    boolean isInClock() {
-      return status != Status.OUT_OF_CLOCK && status != Status.DECAY;
-    }
 
     @Override
     public String toString() {
@@ -560,6 +509,24 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         sb.append(" <--[ HAND ]");
       }
       return sb.toString();
+    }
+  }
+
+  static final class ClockProSettings extends BasicSettings {
+    public ClockProSettings(Config config) {
+      super(config);
+    }
+    public int lowerBoundCold() {
+      return config().getInt("clockpro.lower-bound-resident-cold");
+    }
+    public double percentMinCold() {
+      return config().getDouble("clockpro.percent-min-resident-cold");
+    }
+    public double percentMaxCold() {
+      return config().getDouble("clockpro.percent-max-resident-cold");
+    }
+    public double nonResidentMultiplier() {
+      return config().getDouble("clockpro.non-resident-multiplier");
     }
   }
 
@@ -622,8 +589,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         if ((table[index]) == 0) {
           return 0;
         }
-        if (life > table[index]) {
-          life = table[index];
+        int uintVal = table[index] & 0xFF;
+        if (life > uintVal) {
+          life = uintVal;
         }
       }
       return life;
@@ -644,7 +612,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
     public void decay() {
       for (int i = 0; i < tableSize; i++) {
-        table[i] = (byte) (table[i] >>> 1);
+        table[i] = (byte) ((table[i] & 0xFF) >>> 1);
       }
     }
 
@@ -687,24 +655,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       long hash = (item + SEED[i]) * SEED[i];
       hash += hash >>> 32;
       return (int) hash;
-    }
-  }
-
-  static final class ClockProSettings extends BasicSettings {
-    public ClockProSettings(Config config) {
-      super(config);
-    }
-    public int lowerBoundCold() {
-      return config().getInt("clockpro.lower-bound-resident-cold");
-    }
-    public double percentMinCold() {
-      return config().getDouble("clockpro.percent-min-resident-cold");
-    }
-    public double percentMaxCold() {
-      return config().getDouble("clockpro.percent-max-resident-cold");
-    }
-    public double nonResidentMultiplier() {
-      return config().getDouble("clockpro.non-resident-multiplier");
     }
   }
 }
