@@ -54,69 +54,68 @@ import static com.google.common.base.Preconditions.checkState;
 public final class ClockProNewPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
+  private final int maximumSize;
 
-  // We place all the accessed pages, either hot or cold, into one single list in the order of their
-  // accesses. In the list, the pages with small recency are at the list head, and the pages with
-  // large recency are at the list tail.
-  private Node listHead;
-
+  private Node head;
   private Node hand;
 
-  // Maximum number of resident pages (hot + resident cold)
-  private final int maxSize;
-
   private int sizeHot;
-  private int sizeFree;
+  private int sizeCold;
+  private int sizeFree() { return maximumSize - (sizeHot + sizeCold); }
 
-  // Target number of resident cold pages (adaptive):
-  //  - increases when test page gets a hit
-  //  - decreases when test page is removed
+  // +---------------------------------------------+
+  // |   ColdTarget Adaption Algorithm Summary     |
+  // +------+----------+---------------------------+
+  // | When | increase | access in short irr pages |
+  // |      | decrease |  access in long irr pages |
+  // +------+----------+---------------------------+
+  // | Size | increase |                        +1 |
+  // |      | decrease |                        -1 |
+  // +------+----------+---------------------------+
   private int coldTarget;
+  private int hotTarget() { return maximumSize - coldTarget; }
+
   // {min,max}ResColdSize are boundary of coldTarget.
   private int minResColdSize;
   private int maxResColdSize;
 
-  // Enable to print out the internal state
-  static final boolean debug = false;
-
   private SimpleDecayBloomFilter filter;
-
   private int decayThreshold;
   private int decayTime;
   private int decayMaxLife;
-
   private int[] lives = new int[Byte.SIZE + 1];
+
+  // Enable to print out the internal state
+  static final boolean debug = false;
 
   public ClockProNewPolicy(Config config) {
     ClockProSettings settings = new ClockProSettings(config);
-    this.maxSize = Ints.checkedCast(settings.maximumSize());
-    this.minResColdSize = (int) (maxSize * settings.percentMinCold());
+    this.maximumSize = Ints.checkedCast(settings.maximumSize());
+    this.minResColdSize = (int) (maximumSize * settings.percentMinCold());
     if (minResColdSize < settings.lowerBoundCold()) {
       minResColdSize = settings.lowerBoundCold();
     }
-    this.maxResColdSize = (int) (maxSize * settings.percentMaxCold());
-    if (maxResColdSize > maxSize - minResColdSize) {
-      maxResColdSize = maxSize - minResColdSize;
+    this.maxResColdSize = (int) (maximumSize * settings.percentMaxCold());
+    if (maxResColdSize > maximumSize - minResColdSize) {
+      maxResColdSize = maximumSize - minResColdSize;
     }
     this.policyStats = new PolicyStats("irr.ClockProNew");
     this.data = new Long2ObjectOpenHashMap<>();
     this.coldTarget = minResColdSize;
-    this.listHead = this.hand = null;
-    this.sizeFree = maxSize;
+    this.head = this.hand = null;
     checkState(minResColdSize <= maxResColdSize);
 
-    this.decayThreshold = maxSize;
+    this.decayThreshold = maximumSize;
     this.decayIrrThreshold = 7;
     this.decayMaxLife = 7;
-    filter = new SimpleDecayBloomFilter(maxSize * 5, 0.001, decayMaxLife);
+    filter = new SimpleDecayBloomFilter(maximumSize * 5, 0.001, decayMaxLife);
 
-    lifelimit = maxSize;
+    lifelimit = maximumSize;
   }
 
   private void calcLifeLimitInitVal() {
     lifelimitInitVal = (sizeHot / 2) / Math.max(1, (decayMaxLife - decayIrrThreshold + 1));
-//    lifelimitInitVal = 100;
-    System.out.println("life limit: " + lifelimitInitVal);
+//    System.out.println("life limit: " + lifelimitInitVal);
   }
 
   /**
@@ -164,9 +163,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void onMiss(Node node) {
     policyStats.recordMiss();
-    if (sizeFree > minResColdSize) {
+    if (sizeFree() > minResColdSize) {
       onHotWarmupMiss(node);
-    } else if (sizeFree > 0) {
+    } else if (sizeFree() > 0) {
       onColdWarmupMiss(node);
     } else {
       onFullMiss(node);
@@ -189,7 +188,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
       int prevScanLength = scanLength;
       calcScanLength();
-      System.out.println("Scan length has changed from " + prevScanLength + " to " + scanLength);
+//      System.out.println("Scan length has changed from " + prevScanLength + " to " + scanLength);
     }
   }
 
@@ -208,15 +207,15 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       nextHand();
     }
     node.unlink();
-    if (listHead != null) {
-      node.linkTo(listHead);
+    if (head != null) {
+      node.linkTo(head);
     }
-    listHead = node;
+    head = node;
   }
 
   private void nextHand() {
     checkState(hand != null);
-    checkState(hand != listHead);
+    checkState(hand != head);
     hand = hand.prev;
   }
 
@@ -243,9 +242,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   int scanLength = 1;
   int maxScanLength = 10;
   private void calcScanLength() {
-    System.out.println("in: " + in + ", out: " + out);
-    if (in + out < maxSize) {
-      System.out.println("Sample is too small");
+//    System.out.println("in: " + in + ", out: " + out);
+    if (in + out < maximumSize) {
+//      System.out.println("Sample is too small");
       return;
     }
 
@@ -331,7 +330,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void onNonResidentFullMiss(Node node) {
     evict();
-    if (sizeHot < maxSize - coldTarget) {
+    if (sizeHot < maximumSize - coldTarget) {
       moveToHead(node);
       node.setStatus(Status.HOT_SHORT_IRR);
     } else {
@@ -379,7 +378,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void evict() {
     policyStats.recordEviction();
-    while (sizeFree == 0) {
+    while (sizeFree() == 0) {
       runHand();
     }
   }
@@ -394,11 +393,11 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private void runHand() {
-    if (hand == listHead) {
+    if (hand == head) {
       printClock();
       throw new IllegalStateException();
     }
-    checkState(hand != listHead);
+    checkState(hand != head);
     Node node = hand;
 
     if (node.isCold()) {
@@ -436,24 +435,25 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private boolean canPromote() {
-    if (sizeHot < maxSize - coldTarget) {
-      return true;
+    int targetHot = maximumSize - coldTarget;
+    if (sizeHot >= targetHot) {
+      demoteHot();
     }
-    return demoteHot();
+    return sizeHot < targetHot;
   }
 
   private boolean demoteHot() {
     boolean demote = false;
 //    int scanLimit = 1;
     int scanLimit = scanLength;
-    for (Node node = listHead.prev; node != hand; node = node.prev) {
+    for (Node node = head.prev; node != hand; node = node.prev) {
       checkState(node.isHot() || node.status == Status.DECAY);
 
       if (node.status == Status.DECAY) {
         decayIrrThreshold++;
 //        System.out.println("Increase decayIrrThreshold to " + decayIrrThreshold);
         remove(node);
-        node = listHead;
+        node = head;
         calcLifeLimitInitVal();
         lifelimit = lifelimitInitVal;
         continue;
@@ -469,7 +469,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         node.setStatus(Status.COLD_LONG_IRR);
 
         demote = true;
-        if (sizeHot < maxSize - coldTarget) {
+        if (sizeHot < maximumSize - coldTarget) {
           break;
         }
       }
@@ -486,8 +486,8 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   /** Prints out the internal state of the policy. */
   private void printClock() {
     System.out.println("** CLOCK-Pro list HEAD (small recency) **");
-    System.out.println(listHead.toString());
-    for (Node n = listHead.next; n != listHead; n = n.next) {
+    System.out.println(head.toString());
+    for (Node n = head.next; n != head; n = n.next) {
       System.out.println(n.toString());
     }
     System.out.println("** CLOCK-Pro list TAIL (large recency) **");
@@ -529,11 +529,11 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     }
 
     public void setStatus(Status status) {
-      if (this.isInClock()) { sizeFree++; }
       if (this.isHot()) { sizeHot--; }
+      if (this.isCold()) {sizeCold--; }
       this.status = status;
-      if (this.isInClock()) { sizeFree--; }
       if (this.isHot()) { sizeHot++; }
+      if (this.isCold()) {sizeCold++; }
     }
 
     boolean isShortIrr() {
