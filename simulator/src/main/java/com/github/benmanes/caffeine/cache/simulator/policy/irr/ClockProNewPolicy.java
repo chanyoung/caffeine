@@ -56,32 +56,14 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   private final PolicyStats policyStats;
   private final int maximumSize;
 
-  private Node head;
-  private Node tail() { return head.prev; }
-  private Node hand;
+  private Node shortIrrListHead;
+  private Node longIrrListHead;
 
   private int sizeHot;
   private int sizeCold;
   private int sizeFree() { return maximumSize - (sizeHot + sizeCold); }
 
-  // +---------------------------------------------+
-  // |   ColdTarget Adaption Algorithm Summary     |
-  // +------+----------+---------------------------+
-  // | When | increase | access in short irr pages |
-  // |      | decrease |  access in long irr pages |
-  // +------+----------+---------------------------+
-  // | Size | increase |                        +1 |
-  // |      | decrease |                        -1 |
-  // +------+----------+---------------------------+
-  private int coldTarget;
-  private int hotTarget() { return maximumSize - coldTarget; }
-
-  // {min,max}ResColdSize are boundary of coldTarget.
-  private int minResColdSize;
-  private int maxResColdSize;
-
   private SimpleDecayBloomFilter filter;
-  private int decayThreshold;
   private int decayTime;
   private int decayMaxLife;
   private int[] lives = new int[Byte.SIZE + 1];
@@ -92,31 +74,12 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   public ClockProNewPolicy(Config config) {
     ClockProSettings settings = new ClockProSettings(config);
     this.maximumSize = Ints.checkedCast(settings.maximumSize());
-    this.minResColdSize = (int) (maximumSize * settings.percentMinCold());
-    if (minResColdSize < settings.lowerBoundCold()) {
-      minResColdSize = settings.lowerBoundCold();
-    }
-    this.maxResColdSize = (int) (maximumSize * settings.percentMaxCold());
-    if (maxResColdSize > maximumSize - minResColdSize) {
-      maxResColdSize = maximumSize - minResColdSize;
-    }
     this.policyStats = new PolicyStats("irr.ClockProNew");
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = minResColdSize;
-    this.head = this.hand = null;
-    checkState(minResColdSize <= maxResColdSize);
 
-    this.decayThreshold = maximumSize;
     this.decayIrrThreshold = 8;
     this.decayMaxLife = 8;
-    filter = new SimpleDecayBloomFilter(maximumSize * decayMaxLife, 0.001, decayMaxLife);
-
-    lifelimit = maximumSize;
-  }
-
-  private void calcLifeLimitInitVal() {
-    lifelimitInitVal = (sizeHot / 2) / Math.max(1, (decayMaxLife - decayIrrThreshold + 1));
-//    System.out.println("life limit: " + lifelimitInitVal);
+    filter = new SimpleDecayBloomFilter(maximumSize * decayMaxLife, 0.01, decayMaxLife);
   }
 
   /**
@@ -136,10 +99,8 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     if (debug) {
       printClock();
     }
-//    printClock();
-    Arrays.stream(lives).forEach(System.out::println);
     System.out.println(data.size());
-    System.out.println(decayIrrThreshold);
+    Arrays.stream(lives).forEach(System.out::println);
   }
 
   @Override
@@ -162,10 +123,8 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void onMiss(Node node) {
     policyStats.recordMiss();
-    if (sizeFree() > minResColdSize) {
+    if (sizeFree() > 0) {
       onHotWarmupMiss(node);
-    } else if (sizeFree() > 0) {
-      onColdWarmupMiss(node);
     } else {
       onFullMiss(node);
     }
@@ -173,23 +132,21 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void recordNR(Node node) {
     filter.put(node.key);
-
-    decayTime++;
-    if (decayTime > decayThreshold && decayIrrThreshold > 1) {
-      filter.decay();
-      decayTime = 0;
-
-      Node decay = new Node(0);
-      decay.status = Status.DECAY;
-      decay.linkTo(hand.next);
-      decayIrrThreshold--;
-//      System.out.println("Decrease decayIrrThreshold to " + decayIrrThreshold);
-    }
   }
 
   private void remove(Node node) {
-    if (node == hand) {
-      nextHand();
+    if (node == shortIrrListHead) {
+      if (node.next == node) {
+        shortIrrListHead = null;
+      } else {
+        shortIrrListHead = shortIrrListHead.next;
+      }
+    } else if (node == longIrrListHead) {
+      if (node.next == node) {
+        longIrrListHead = null;
+      } else {
+        longIrrListHead = longIrrListHead.next;
+      }
     }
     node.unlink();
     if (node.status != Status.DECAY) {
@@ -197,42 +154,54 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     }
   }
 
-  private void moveToHead(Node node) {
-    if (node == hand) {
-      nextHand();
+  private void moveToShortIrrHead(Node node) {
+    if (node == shortIrrListHead) {
+      return;
+    } else if (node == longIrrListHead) {
+      if (node.next == node) {
+        longIrrListHead = null;
+      } else {
+        longIrrListHead = longIrrListHead.next;
+      }
     }
     node.unlink();
-    if (head != null) {
-      node.linkTo(head);
+    if (shortIrrListHead != null) {
+      node.linkTo(shortIrrListHead);
     }
-    head = node;
+    shortIrrListHead = node;
   }
 
-  private void nextHand() {
-    checkState(hand != null);
-    checkState(hand != head);
-    hand = hand.prev;
+  private void moveToLongIrrHead(Node node) {
+    if (node == longIrrListHead) {
+      return;
+    } else if (node == shortIrrListHead) {
+      if (node.next == node) {
+        shortIrrListHead = null;
+      } else {
+        shortIrrListHead = shortIrrListHead.next;
+      }
+    }
+    node.unlink();
+    if (longIrrListHead != null) {
+      node.linkTo(longIrrListHead);
+    }
+    longIrrListHead = node;
   }
 
   /** Records a miss when the hot set is not full. */
   private void onHotWarmupMiss(Node node) {
-    moveToHead(node);
-    node.setStatus(Status.HOT_SHORT_IRR);
+    moveToShortIrrHead(node);
+    node.setStatus(Status.HOT_LONG_IRR);
   }
 
   /** Records a miss when the cold set is not full. */
   private void onColdWarmupMiss(Node node) {
-    moveToHead(node);
+    moveToShortIrrHead(node);
     node.setStatus(Status.COLD_SHORT_IRR);
-    if (hand == null) {
-      hand = node;
-    }
   }
 
   int decayIrrThreshold;
-
-  int lifelimitInitVal;
-  int lifelimit;
+  int scanSpeedCredits;
 
   /** Records a miss when the hot and cold set are full. */
   private void onFullMiss(Node node) {
@@ -251,21 +220,14 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       return;
     }
 
-    if (freshness == decayMaxLife) {
-      coldTargetAdjust(+1);
+    if (freshness >= decayMaxLife - 1) {
+      scanSpeedCredits++;
     } else {
-      coldTargetAdjust(-1);
+      scanSpeedCredits--;
     }
 
-    if (freshness > decayIrrThreshold) {
+    if (freshness >= decayIrrThreshold + (decayIrrThreshold != decayMaxLife ? 1 : 0)) {
       onNonResidentFullMiss(node);
-    } else if (freshness == decayIrrThreshold) {
-      if (lifelimit > 0) {
-        onNonResidentFullMiss(node);
-        lifelimit--;
-      } else {
-        onOutOfClockFullMiss(node);
-      }
     } else {
       onOutOfClockFullMiss(node);
     }
@@ -273,114 +235,145 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private void onOutOfClockFullMiss(Node node) {
     evict();
-    moveToHead(node);
+    moveToShortIrrHead(node);
     node.setStatus(Status.COLD_SHORT_IRR);
   }
 
   private void onNonResidentFullMiss(Node node) {
+    findVictimFromLongIrr();
     evict();
-    if (sizeHot >= hotTarget()) {
-      demoteHot();
+    moveToShortIrrHead(node);
+    node.setStatus(Status.HOT_LONG_IRR);
+  }
+
+  int scanLengthLimit = 1;
+
+  private void findVictimFromLongIrr() {
+    for (int scanLength = 0; scanLength < scanLengthLimit; scanLength++) {
+      if (longIrrListHead == null) {
+        return;
+      }
+      Node longIrrListTail = longIrrListHead.prev;
+      if (longIrrListTail.status == Status.DECAY) {
+        decayIrrThreshold++;
+        System.out.println("Increase decayIrrThreshold to " + decayIrrThreshold);
+        remove(longIrrListTail);
+        scanLength--;
+        continue;
+      }
+      if (longIrrListTail.marked) {
+        scanSpeedCredits--;
+        moveToShortIrrHead(longIrrListTail);
+        longIrrListTail.setStatus(Status.HOT_LONG_IRR);
+      } else {
+        moveToShortIrrHead(longIrrListTail);
+        longIrrListTail.setStatus(Status.COLD_LONG_IRR);
+      }
     }
-    if (sizeHot < hotTarget()) {
-      moveToHead(node);
-      node.setStatus(Status.HOT_SHORT_IRR);
-    } else {
-      moveToHead(node);
-      node.setStatus(Status.COLD_SHORT_IRR);
+  }
+
+  private void findVictimFromShortIrr() {
+    while (shortIrrListHead == null) {
+      findVictimFromLongIrr();
     }
+    while (shortIrrListHead != null) {
+      decayTime++;
+      if (decayTime > maximumSize) {
+        filter.decay();
+        decayTime = 0;
+
+        Node decay = new Node(0);
+        moveToLongIrrHead(decay);
+        decay.status = Status.DECAY;
+        decayIrrThreshold--;
+        System.out.println("Decrease decayIrrThreshold to " + decayIrrThreshold);
+
+        adjustScanLength();
+      }
+
+      Node shortIrrListTail = shortIrrListHead.prev;
+      if (shortIrrListTail.marked) {
+        if (shortIrrListTail.isShortIrr()) {
+          scanSpeedCredits++;
+        }
+        if (shortIrrListTail.status == Status.HOT_LONG_IRR) {
+          moveToShortIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.HOT_SHORT_IRR);
+        } else if (shortIrrListTail.status == Status.HOT_SHORT_IRR) {
+          moveToShortIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.HOT_SHORT_IRR);
+        } else if (shortIrrListTail.status == Status.COLD_LONG_IRR) {
+          moveToShortIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.COLD_SHORT_IRR);
+        } else if (shortIrrListTail.status == Status.COLD_SHORT_IRR) {
+          findVictimFromLongIrr();
+          moveToShortIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.HOT_SHORT_IRR);
+        }
+      } else {
+        if (shortIrrListTail.status == Status.HOT_LONG_IRR) {
+          moveToLongIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.HOT_LONG_IRR);
+        } else if (shortIrrListTail.status == Status.HOT_SHORT_IRR) {
+          moveToLongIrrHead(shortIrrListTail);
+          shortIrrListTail.setStatus(Status.HOT_LONG_IRR);
+        } else if (shortIrrListTail.status == Status.COLD_LONG_IRR) {
+          remove(shortIrrListTail);
+          break;
+        } else if (shortIrrListTail.status == Status.COLD_SHORT_IRR) {
+          recordNR(shortIrrListTail);
+          remove(shortIrrListTail);
+          break;
+        }
+      }
+    }
+  }
+
+  private void adjustScanLength() {
+    if (scanSpeedCredits > 0) {
+      scanLengthLimit++;
+    } else if (scanSpeedCredits < 0) {
+      scanLengthLimit--;
+    }
+    if (scanLengthLimit < 1) {
+      scanLengthLimit = 1;
+    } else if (scanLengthLimit > 3) {
+      scanLengthLimit = 3;
+    }
+    System.out.println("Scan length limit has changed to : " + scanLengthLimit);
+    scanSpeedCredits /= 10;
+    System.out.println("ScanSpeedCredits: " + scanSpeedCredits);
   }
 
   private void evict() {
     policyStats.recordEviction();
     while (sizeFree() == 0) {
-      runHand();
-    }
-  }
-
-  private void coldTargetAdjust(int n) {
-    coldTarget += n;
-    if (coldTarget < minResColdSize) {
-      coldTarget = minResColdSize;
-    } else if (coldTarget > maxResColdSize) {
-      coldTarget = maxResColdSize;
-    }
-  }
-
-  private void runHand() {
-    if (hand == head) {
-      printClock();
-      throw new IllegalStateException();
-    }
-    checkState(hand != head);
-    Node node = hand;
-
-    if (node.isCold()) {
-      if (node.marked) {
-        if (node.isShortIrr()) {
-          coldTargetAdjust(+1);
-        }
-
-        if (canPromote()) {
-          moveToHead(node);
-          node.setStatus(Status.HOT_SHORT_IRR);
-        } else {
-          moveToHead(node);
-          node.setStatus(Status.COLD_SHORT_IRR);
-        }
-      } else {
-        if (node.isShortIrr()) {
-          recordNR(node);
-        }
-        remove(node);
+      if (sizeCold == 0) {
+        findVictimFromLongIrr();
       }
-    } else {
-      nextHand();
-    }
-  }
-
-  private boolean canPromote() {
-    int targetHot = maximumSize - coldTarget;
-    if (sizeHot >= targetHot) {
-      demoteHot();
-    }
-    return sizeHot < targetHot;
-  }
-
-  private void consumeDecay() {
-    while (tail().status == Status.DECAY) {
-      decayIrrThreshold++;
-      System.out.println("Increase decayIrrThreshold to " + decayIrrThreshold);
-      remove(tail());
-      calcLifeLimitInitVal();
-      lifelimit = lifelimitInitVal;
-    }
-  }
-
-  private void demoteHot() {
-    consumeDecay();
-    Node node = tail();
-    if (node == hand) {
-      return;
-    }
-    checkState(node.isHot());
-    if (node.marked) {
-      moveToHead(node);
-      node.setStatus(Status.HOT_LONG_IRR);
-    } else {
-      moveToHead(node);
-      node.setStatus(Status.COLD_LONG_IRR);
+      findVictimFromShortIrr();
     }
   }
 
   /** Prints out the internal state of the policy. */
   private void printClock() {
-    System.out.println("** CLOCK-Pro list HEAD (small recency) **");
-    System.out.println(head.toString());
-    for (Node n = head.next; n != head; n = n.next) {
-      System.out.println(n.toString());
+    if (shortIrrListHead != null) {
+      System.out.println("** CLOCK-Pro short irr list HEAD (small recency) **");
+      System.out.println(shortIrrListHead.toString());
+      for (Node n = shortIrrListHead.next; n != shortIrrListHead; n = n.next) {
+        System.out.println(n.toString());
+      }
+      System.out.println("** CLOCK-Pro short irr list TAIL (large recency) **");
     }
-    System.out.println("** CLOCK-Pro list TAIL (large recency) **");
+    if (longIrrListHead != null) {
+      System.out.println("===================================================");
+      System.out.println("** CLOCK-Pro long irr list HEAD (small recency) **");
+      System.out.println(longIrrListHead.toString());
+      for (Node n = longIrrListHead.next; n != longIrrListHead; n = n.next) {
+        System.out.println(n.toString());
+      }
+      System.out.println("** CLOCK-Pro long irr list TAIL (large recency) **");
+    }
   }
 
   enum Status {
@@ -443,9 +436,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
           .add("marked", marked)
           .add("type", status)
           .toString());
-      if (this == hand) {
-        sb.append(" <--[ HAND ]");
-      }
       return sb.toString();
     }
   }
