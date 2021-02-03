@@ -201,7 +201,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   int decayIrrThreshold;
-  int scanSpeedCredits;
+  int longIrrIsValuable;
 
   /** Records a miss when the hot and cold set are full. */
   private void onFullMiss(Node node) {
@@ -220,10 +220,17 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       return;
     }
 
-    if (freshness >= decayMaxLife - 1) {
-      scanSpeedCredits++;
-    } else {
-      scanSpeedCredits--;
+    if (freshness == decayMaxLife) {
+      longIrrIsValuable++;
+      evict();
+      if (canPromote()) {
+        moveToShortIrrHead(node);
+        node.setStatus(Status.HOT_SHORT_IRR);
+      } else {
+        moveToShortIrrHead(node);
+        node.setStatus(Status.COLD_SHORT_IRR);
+      }
+      return;
     }
 
     if (freshness >= decayIrrThreshold + (decayIrrThreshold != decayMaxLife ? 1 : 0)) {
@@ -240,18 +247,23 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private void onNonResidentFullMiss(Node node) {
-    findVictimFromLongIrr();
     evict();
-    moveToShortIrrHead(node);
-    node.setStatus(Status.HOT_LONG_IRR);
+    if (canPromote()) {
+      moveToShortIrrHead(node);
+      node.setStatus(Status.HOT_LONG_IRR);
+    } else {
+      moveToShortIrrHead(node);
+      node.setStatus(Status.COLD_LONG_IRR);
+    }
   }
 
   int scanLengthLimit = 1;
 
-  private void findVictimFromLongIrr() {
+  private boolean canPromote() {
+    boolean isDemoted = false;
     for (int scanLength = 0; scanLength < scanLengthLimit; scanLength++) {
       if (longIrrListHead == null) {
-        return;
+        return true;
       }
       Node longIrrListTail = longIrrListHead.prev;
       if (longIrrListTail.status == Status.DECAY) {
@@ -262,19 +274,21 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         continue;
       }
       if (longIrrListTail.marked) {
-        scanSpeedCredits--;
+        longIrrIsValuable++;
         moveToShortIrrHead(longIrrListTail);
         longIrrListTail.setStatus(Status.HOT_LONG_IRR);
       } else {
         moveToShortIrrHead(longIrrListTail);
         longIrrListTail.setStatus(Status.COLD_LONG_IRR);
+        isDemoted = true;
       }
     }
+    return isDemoted;
   }
 
   private void findVictimFromShortIrr() {
     while (shortIrrListHead == null) {
-      findVictimFromLongIrr();
+      canPromote();
     }
     while (shortIrrListHead != null) {
       decayTime++;
@@ -294,7 +308,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       Node shortIrrListTail = shortIrrListHead.prev;
       if (shortIrrListTail.marked) {
         if (shortIrrListTail.isShortIrr()) {
-          scanSpeedCredits++;
+          longIrrIsValuable--;
         }
         if (shortIrrListTail.status == Status.HOT_LONG_IRR) {
           moveToShortIrrHead(shortIrrListTail);
@@ -306,9 +320,13 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
           moveToShortIrrHead(shortIrrListTail);
           shortIrrListTail.setStatus(Status.COLD_SHORT_IRR);
         } else if (shortIrrListTail.status == Status.COLD_SHORT_IRR) {
-          findVictimFromLongIrr();
-          moveToShortIrrHead(shortIrrListTail);
-          shortIrrListTail.setStatus(Status.HOT_SHORT_IRR);
+          if (canPromote()) {
+            moveToShortIrrHead(shortIrrListTail);
+            shortIrrListTail.setStatus(Status.HOT_SHORT_IRR);
+          } else {
+            moveToShortIrrHead(shortIrrListTail);
+            shortIrrListTail.setStatus(Status.COLD_SHORT_IRR);
+          }
         }
       } else {
         if (shortIrrListTail.status == Status.HOT_LONG_IRR) {
@@ -317,6 +335,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
         } else if (shortIrrListTail.status == Status.HOT_SHORT_IRR) {
           moveToLongIrrHead(shortIrrListTail);
           shortIrrListTail.setStatus(Status.HOT_LONG_IRR);
+          shortIrrListTail.marked = true;
         } else if (shortIrrListTail.status == Status.COLD_LONG_IRR) {
           remove(shortIrrListTail);
           break;
@@ -330,10 +349,10 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private void adjustScanLength() {
-    if (scanSpeedCredits > 0) {
-      scanLengthLimit++;
-    } else if (scanSpeedCredits < 0) {
+    if (longIrrIsValuable > 0) {
       scanLengthLimit--;
+    } else if (longIrrIsValuable < 0) {
+      scanLengthLimit++;
     }
     if (scanLengthLimit < 1) {
       scanLengthLimit = 1;
@@ -341,15 +360,15 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       scanLengthLimit = 3;
     }
     System.out.println("Scan length limit has changed to : " + scanLengthLimit);
-    scanSpeedCredits /= 10;
-    System.out.println("ScanSpeedCredits: " + scanSpeedCredits);
+    longIrrIsValuable /= 2;
+    System.out.println("ScanSpeedCredits: " + longIrrIsValuable);
   }
 
   private void evict() {
     policyStats.recordEviction();
     while (sizeFree() == 0) {
       if (sizeCold == 0) {
-        findVictimFromLongIrr();
+        canPromote();
       }
       findVictimFromShortIrr();
     }
