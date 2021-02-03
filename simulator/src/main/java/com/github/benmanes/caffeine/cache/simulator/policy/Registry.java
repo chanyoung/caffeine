@@ -34,13 +34,7 @@ import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.adaptive.ArcPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.adaptive.CarPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.adaptive.CartPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.ClockProPlusPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.ClockProPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.DClockPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.FrdPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.HillClimberFrdPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.IndicatorFrdPolicy;
-import com.github.benmanes.caffeine.cache.simulator.policy.irr.LirsPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.irr.*;
 import com.github.benmanes.caffeine.cache.simulator.policy.linked.FrequentlyUsedPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.linked.LinkedPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.linked.MultiQueuePolicy;
@@ -204,6 +198,7 @@ public final class Registry {
     register(LirsPolicy.class, LirsPolicy::new);
     register(ClockProPolicy.class, ClockProPolicy::new);
     register(ClockProPlusPolicy.class, ClockProPlusPolicy::new);
+    register(ClockProNewPolicy.class, ClockProNewPolicy::new);
 
     registerMany(DClockPolicy.class, DClockPolicy::policies);
   }
