@@ -70,7 +70,22 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   // sizeCold가 0인 경우, handCold 는 null을 가르킨다.
   //
   // 2. handTest의 구현.
-  // - handTest는
+  // - handTest는 handHot을 만나면 흡수되는 형식으로 구현되는 것이 맞다.
+  // handTest가 지나가면서 resident cold entry를 만날일은 없다.
+  // 따라서 handTest의 역할은 오로지 NR이 limit을 넘어가면 삭제하는 것, 그 이상도 이하도 아니다.
+  // NR이 limit을 넘어가면 handHot으로부터 출발하여, NR을 목표만큼 삭제하고 머무르면 된다. 그러다가 handHot이 뒤에서 쫓아와서
+  // 만나게 되면, null로 만들면 된다. handHot은 handTest의 역할도 함께 수행한다.
+  //
+  // 3. handHot의 구현.
+  // - handHot을 움직이는 시계바늘로 구현할라 하면 골치가 아파지지만, 포인터 이동 연산이 더 저렴하긴 하니까.
+  // cold가 0이 되는 경우, handCold를 null로 만들었다가 cold 엔트리가 생기면 추가해준다.
+  // hot이 0이 되는 경우, handHot을 null로 만들고, 리스트헤드는 handCold가 대체한다.
+  // hot이 새로 생기는 경우, handHot을 할당하고 handHot이 다시 리스트헤드를 갖는다.
+  //
+  // - handHot을 고정된 리스트 테일로 구현한다면.
+  // cold가 0이 되는 경우, handCold를 null로 만들었다가 cold 엔트리가 생기면 추가해준다.
+  // hot이 0이 되는 경우, irr을 비교할 hot entry가 없으므로, NR도 필요없다? clock 알고리즘과 동일하게 동작한다.
+  // 하지만 NR이 아예 없으면, ARC 어댑션을 적용한 상태에서 hotTarget을 늘릴 방도가 없다.
   private Node clockTail() { return clockHead == null ? null : clockHead.prev; }
 
   private int sizeHot;
