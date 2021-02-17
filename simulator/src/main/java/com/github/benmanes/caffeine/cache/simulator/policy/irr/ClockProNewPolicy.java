@@ -61,10 +61,21 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   private Node clockHead;
   private Node clockHand;
+  // HandHot은 별도로 구현할 필요 없다. tail 이 결국 handHot이라고 볼 수 있다.
+  // 하지만 이 경우 다음과 같은 의문을 가질 수 있다.
+  // 1. handCold 가 handHot을 지나갈 수 있는가?
+  // - 지나갈 수 없다. handCold가 listTail로부터 출발하여 한바퀴 돌아 다시 listTail에 온다면 sizeCold == 0 인 상황이다.
+  // sizeCold가 0이면 handCold는 움직이지 않는다. 따라서 handCold는 listTail을 지나갈 수 없다.
+  // 추후 coldEntry가 생성이 되면 listTail로부터 다시 출발한다는 개념이 맞다.
+  // sizeCold가 0인 경우, handCold 는 null을 가르킨다.
+  //
+  // 2. handTest의 구현.
+  // - handTest는
   private Node clockTail() { return clockHead == null ? null : clockHead.prev; }
 
   private int sizeHot;
   private int sizeCold;
+  private int sizeDemoted;
   private int sizeFree() { return maximumSize - (sizeHot + sizeCold); }
 
   private SimpleDecayBloomFilter filter;
@@ -126,6 +137,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     } else {
       onHit(node);
     }
+//    if (policyStats.operationCount() % 10000 == 0) {
+//      System.out.println(vHotTarget * 100.0 / maximumSize);
+//    }
   }
 
   private void onHit(Node node) {
@@ -134,6 +148,14 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private void onMiss(Node node) {
+    // cold를 늘릴 수 있는 길이마다 decayThreshold를 조절해나가면 어떨까?
+    // 예를 들어서, cold entry가 1% 일때는, max의 98% 까지 늘릴 수 있으니까, decayThreshold를 max의 98%로 지정하는거지.
+    // 이러면 유틸리티 어댑션 안해도 되지 않을까?
+    //
+    // 보통의 케이스에서는 안해도 되는데, DS1에서 안하니까, hotTarget이 낮아져 버려서, scanLength가 길어져서 의미가 없어지네.
+    // scanLength는 vHotTarget과 별개로 제어해야하나?
+    decayThreshold = maximumHotSize - sizeCold;
+
     policyStats.recordMiss();
     if (sizeFree() > maximumSize - maximumHotSize) {
       onHotWarmupMiss(node);
@@ -236,8 +258,17 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     }
 
     if (freshness == decayMaxLife || freshness > nonResidentIrrThreshold) {
-      if (vHotTarget > (maximumSize - maximumHotSize)) {
-        vHotTarget--;
+      // 굉장히 애매하다. Irr 1 이상인 고스트의 경우 hotTarget을 줄이는게 맞나?
+      // Irr이 1 이상이면 어차피 cold 에서 담아내지 못한다. 그렇다면 HotTarget을 줄이지 않는게 맞다.
+      // 하지만 HotTarget을 줄이지 않으면? scanhot이 안일어나는게 문제네, 일단 무조건 1번은 일어나야한다.
+      // 근데 그렇게 구현 안했었는데, 생각해보니 오리지날 CP에서도 scanhot을 하긴하네.
+//      if (vHotTarget > (maximumSize - maximumHotSize)) {
+//        vHotTarget--;
+//      }
+      if (freshness >= decayMaxLife) {
+        if (vHotTarget > (maximumSize - maximumHotSize)) {
+          vHotTarget--;
+        }
       }
       onNonResidentFullMiss(node);
     } else {
@@ -289,13 +320,57 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
             node.setStatus(Status.COLD_SHORT_IRR);
           }
         } else {
+          // 유틸리티 어댑션이 과연 효율적인가?
+          // 유틸리티 어댑션의 장점은 무엇이라고 생각하나?
+          // 나는 일단 NR을 지울때 hotTarget을 늘린다는 개념 자체가 틀렸다고 본다.
+          // 현재 CP에서 지워지는 NR의 경우 irr이 hot 엔트리 중 가장 irr이 긴 녀석보다 긴 엔트리들이다.
+          // 이 케이스가 많은것이 왜 hotTarget을 늘려야 하는 이유가 되는것인가?
+          //
+          // irr이 제일 긴 hot보다 더 긴 NR의 개수가 늘어나면 hotTarget을 늘려야 한다는 것은 미래에 대한 예측이며 간접적인 이유이다.
+          // 그에 반해 내가 irr이 긴 hot 엔트리들을 쫓아냈더니, 잠시후에 그 엔트리에 접근이 된 경우는 직전 행동에 대한 결과이며 직접적인 이유이다.
+          // 따라서 결과에 의한 보상으로 움직이는 adaptive 모델이 더 적합하다.
+          //
+          // 현재 모델에서 2번 이상 접근된 엔트리는 hot 리스트에 올라가게 된다. 따라서 cold 리스트의 크기는
+          // 단지 2번째 접근이 이루어지기까지의 irr을 담고있을만한 길이를 최대한 맞춰줄 수 있으면 된다.
+          //
+          // 위 생각을 바탕으로 보면 NR에서 hit되는 경우가 아닌, resident cold가 hit되는 경우에 콜드 비중을 늘리는 것도
+          // 크게 좋은 방법은 아니게 된다. 왜냐하면 이미 현재 확보된 콜드 엔트리의 길이로 두번째 hit를 담아냈기 때문에,
+          // 콜드 엔트리의 길이를 더 늘릴 필요가 없기 떄문이다.
+          //
+          // 그렇다면, 결과적으로 hot target을 늘릴때는 hot 엔트리에서 쫓아낸 것이 다시 hit가 되었을 때 hot 엔트리를 늘려갈 필요가 있는거고
+          // cold 엔트리에서 쫓겨난 것이 다시 hit가 되었을 때 cold 엔트리를 늘리는 것이 적합한 adaptive 모델이 된다.
+          // 그리고 이 모델은 ARC의 모델이다.
+          //
+          // CP+는 위 모델을 아주 훌륭하게 CP에 입혔다. CP는 hot에서 demotion되는 경우 바로 축출하지 않고 test 기간이 지난 cold 엔트리로
+          // 보내는데, 이는 ARC의 B2와 동일한 역할을 한다.
+          //
+          // NR에 hit되는 경우 hotTarget을 줄인다고 했을 때.
+          // sketch 알고리즘의 경우 어느 경우까지 허용을 해 주어야 하는 것일까?
+          // 결과적으로 NR 개수가 maximum size 보다 멀리있는 경우는 hotTarget을 줄일 필요가 없다.
+          // 왜냐하면 그 정도 길이의 irr로 접근되었다는 것은 캐시에서 콜드 엔트리 비중이 99%라고 해도 어차피 담아낼 수 없기 떄문이다.
+          // 하지만 irr이 현재 hot 엔트리보다 안에 있으므로 hot엔트리로의 진급은 시켜주면 된다.
+          //
+          // demoted 엔트리의 유틸리티 어댑션 케이스.
+          // 이는 다소 불공정게임이라 할 수 있다. 왜냐하면 demoted 엔트리는 handCold에 의해 소멸되는데, 이 속도가 매우 빠를 가능성이 크기 때문이다.
+          // 그리고 CP는 ARC와 달리 demoted 엔트리가 삭제될 경우 irr 규칙에 따라 히스토리를 생성하지 않기 때문에, hotTarget이 상승할 확률이
+          // 다소 부족하다고 볼 수 있다. 따라서 CP+는 유틸리티 어댑션을 보완하여 성공을 거뒀다.
+          //
+          // (반대의견) 유틸리티 어댑션이 필요한가? CP의 경우 cold가 줄어들면 NR은 늘어나고, cold가 늘어날 확률은 자연스레 커지고
+          // cold가 늘어나면 NR이 줄고 demoted 된 애들이 많아 hot으로 갈 확률이 알아서 커질텐데?
+          //
+          // 유틸리티 어댑션을 어떻게 해야하는가가 의문이네.
           if (vHotTarget < maximumHotSize) {
-            int max = maximumSize * (decayMaxLife - nonResidentIrrThreshold + 1);
-            vHotTarget += max / (sizeHot / 4);
-            if (vHotTarget > maximumHotSize) {
-              vHotTarget = maximumHotSize;
-            }
-//            vHotTarget++;
+//            int max = maximumSize * (decayMaxLife - nonResidentIrrThreshold + 1);
+//            vHotTarget += max / (sizeHot / 4);
+//            if (vHotTarget > maximumHotSize) {
+//              vHotTarget = maximumHotSize;
+//            }
+            vHotTarget++;
+
+//            vHotTarget += Math.max(1, maximumSize / (sizeDemoted + 1));
+//            if (vHotTarget > maximumHotSize) {
+//              vHotTarget = maximumHotSize;
+//            }
           }
           moveToHead(node);
           node.setStatus(Status.COLD_SHORT_IRR);
@@ -314,30 +389,34 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   private void scanHot() {
     updateScanLength();
 
-    int scanned = 0;
-    for (Node node = clockTail(); node != clockHand; node = node.prev) {
-      checkState(node.isHot() || node.status == Status.DECAY);
-      if (sizeHot <= maximumSize - maximumHotSize || scanned > scanLengthLimit) {
-        break;
-      }
+    // scan을 바로 쫓아가는게 의미가 있을까?
+//    scanLengthLimit = 1;
+//    while (sizeHot >= vHotTarget && clockTail() != clockHand) {
+      int scanned = 0;
+      for (Node node = clockTail(); node != clockHand; node = node.prev) {
+        checkState(node.isHot() || node.status == Status.DECAY);
+        if (sizeHot <= maximumSize - maximumHotSize || scanned > scanLengthLimit) {
+          break;
+        }
 
-      if (node.status == Status.DECAY) {
-        nonResidentIrrThreshold++;
+        if (node.status == Status.DECAY) {
+          nonResidentIrrThreshold++;
 //        System.out.println("Increase decayIrrThreshold to " + decayIrrThreshold);
-        remove(node);
-        node = clockHead;
-        continue;
-      }
+          remove(node);
+          node = clockHead;
+          continue;
+        }
 
-      scanned++;
-      if (node.marked) {
-        moveToHead(node);
-        node.setStatus(Status.HOT);
-      } else {
-        moveToHead(node);
-        node.setStatus(Status.COLD_LONG_IRR);
+        scanned++;
+        if (node.marked) {
+          moveToHead(node);
+          node.setStatus(Status.HOT);
+        } else {
+          moveToHead(node);
+          node.setStatus(Status.COLD_LONG_IRR);
+        }
       }
-    }
+//    }
   }
 
   /** Prints out the internal state of the policy. */
@@ -388,9 +467,11 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     public void setStatus(Status status) {
       if (this.isHot()) { sizeHot--; }
       if (this.isCold()) {sizeCold--; }
+      if (this.status == Status.COLD_LONG_IRR) { sizeDemoted--; }
       this.status = status;
       if (this.isHot()) { sizeHot++; }
       if (this.isCold()) {sizeCold++; }
+      if (this.status == Status.COLD_LONG_IRR) { sizeDemoted++; }
     }
 
     boolean isShortIrr() {
