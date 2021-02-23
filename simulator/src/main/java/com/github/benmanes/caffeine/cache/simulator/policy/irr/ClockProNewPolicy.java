@@ -117,7 +117,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     this.decayMaxLife = 8;
     filter = new SimpleDecayBloomFilter(maximumSize * decayMaxLife, 0.001, decayMaxLife);
 
-    this.vHotTarget = maximumHotSize;
+    this.vHotTarget = maximumSize - maximumHotSize;
   }
 
   /**
@@ -172,7 +172,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     decayThreshold = maximumHotSize - sizeCold;
 
     policyStats.recordMiss();
-    if (sizeFree() > maximumSize - maximumHotSize) {
+    if (sizeFree() > maximumSize) {
       onHotWarmupMiss(node);
     } else if (sizeFree() > 0) {
       onColdWarmupMiss(node);
@@ -322,6 +322,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     Node node = clockHand;
     if (node.isCold()) {
       if (node.marked) {
+        node.count++;
         if (node.isShortIrr()) {
           if (sizeHot >= vHotTarget) {
             scanHot();
@@ -391,13 +392,25 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
           node.setStatus(Status.COLD_SHORT_IRR);
         }
       } else {
-        if (node.isShortIrr()) {
-          recordHistory(node.key);
+        if (node.count != 0) {
+          node.count /= 2;
+          moveToHead(node);
+          node.setStatus(Status.COLD_SHORT_IRR);
+        } else {
+          if (node.isShortIrr()) {
+            recordHistory(node.key);
+          }
+          remove(node);
         }
-        remove(node);
       }
     } else {
-      nextHand();
+      if (node.marked) {
+        moveToHead(node);
+        node.setStatus(Status.HOT);
+        node.count++;
+      } else {
+        nextHand();
+      }
     }
   }
 
@@ -424,9 +437,11 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
         scanned++;
         if (node.marked) {
+          node.count++;
           moveToHead(node);
           node.setStatus(Status.HOT);
         } else {
+          node.count /= 2;
           moveToHead(node);
           node.setStatus(Status.COLD_LONG_IRR);
         }
@@ -455,6 +470,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     Status status;
     Node prev;
     Node next;
+    int count;
 
     boolean marked;
 
@@ -462,6 +478,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       this.key = key;
       prev = next = this;
       status = Status.OUT_OF_CLOCK;
+      count = 0;
     }
 
     public void linkTo(Node node) {
