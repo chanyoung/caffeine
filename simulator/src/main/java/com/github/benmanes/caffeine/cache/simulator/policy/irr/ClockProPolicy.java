@@ -105,7 +105,7 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
     }
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = minResColdSize;
+    this.coldTarget = maxResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
     checkState(minResColdSize <= maxResColdSize);
@@ -154,7 +154,7 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-    if (sizeFree > minResColdSize) {
+    if (sizeFree > maxResColdSize) {
       onHotWarmupMiss(node);
     } else if (sizeFree > 0) {
       onColdWarmupMiss(node);

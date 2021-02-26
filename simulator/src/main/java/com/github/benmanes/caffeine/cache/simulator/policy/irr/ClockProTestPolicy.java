@@ -69,6 +69,8 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
   // list.
   private Node handTest;
 
+  private Node handNRPassed;
+
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
   private final int maxNonResSize;
@@ -78,6 +80,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
   private int sizeNonResCold;
   private int sizeInTest;
   private int sizeFree;
+  private int sizeNRPassed;
 
   // Target number of resident cold pages (adaptive):
   //  - increases when test page gets a hit
@@ -104,6 +107,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     }
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
+    this.coldTarget = maxResColdSize;
     this.coldTarget = minResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
@@ -126,10 +130,13 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
 
   @Override
   public void record(long key) {
+//    if (policyStats.operationCount() % 100000 == 0) {
+//      System.out.println(coldTarget * 100.0 / maxSize);
+//    }
     policyStats.recordOperation();
     Node node = data.get(key);
     if (node == null) {
-      node = new Node(key);
+      node = new Node(key, policyStats.operationCount());
       data.put(key, node);
       onMiss(node);
     } else if (node.isResident()) {
@@ -141,6 +148,18 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       validateStatus();
       validateClockStructure();
     }
+
+    if (policyStats.operationCount() % maxSize == 0) {
+      stat();
+    }
+  }
+
+  int lessThan1IRR = 0;
+
+  private void stat() {
+    System.out.println("Less than 1 IRR count: " + lessThan1IRR);
+
+    lessThan1IRR /= 2;
   }
 
   private void onHit(Node node) {
@@ -153,6 +172,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
+//    if (sizeFree > maxResColdSize) {
     if (sizeFree > minResColdSize) {
       onHotWarmupMiss(node);
     } else if (sizeFree > 0) {
@@ -190,9 +210,26 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     // at the list head. The page also initiates its test period.
     evict();
     node.moveToHead(Status.COLD_RES_IN_TEST);
+    node.createdVirtualTime = policyStats.operationCount();
   }
 
   private void onNonResidentFullMiss(Node node) {
+    // Adjust cold target.
+//    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize - coldTarget) {
+//    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize + maxResColdSize * policyStats.hitRate()) {
+//    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize) { // + maxResColdSize * policyStats.hitRate()) {
+//      coldTargetAdjust(+1);
+//    } else {
+//      coldTargetAdjust(-1);
+//    }
+//    if (node.passed) {
+//      coldTargetAdjust(-1);
+//      sizeNRPassed--;
+//      node.passed = false;
+//    } else {
+//      coldTargetAdjust(+1);
+//    }
+
     // If the cold page is in the list, the faulted page turns into a hot page and is placed at the
     // head of the list. We run handHot to turn a hot page with a large recency into a cold page.
     //
@@ -220,8 +257,6 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (!candidate.isInClock() || !candidate.isInTest()) {
       return false;
     }
-    // This candidate cold page is accessed during its test period, so we increment coldTarget by 1.
-    coldTargetAdjust(+1);
     while (sizeHot >= maxSize - coldTarget) {
       // handHot has passed the candidate and terminates its test period. Reject the promotion.
       if (!candidate.isInTest()) {
@@ -253,13 +288,16 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
         }
       } else {
         handCold.moveToHead(Status.COLD_RES_IN_TEST);
+//        coldTargetAdjust(-1);
       }
     } else {
       // If the reference bit of the cold page currently pointed to by handCold is unset, we replace
       // the cold page for a free space. If the replaced cold page is in its test period, then it
       // will remain in the list as a non-resident cold page until it runs out of its test period.
       // If the replaced cold page is not in its test period, we move it out of the clock.
+      checkState(!handCold.passed);
       if (handCold.isInTest()) {
+//        handCold.createdVirtualTime = policyStats.operationCount();
         handCold.setStatus(Status.COLD_NON_RES);
         handCold = handCold.prev;
       } else {
@@ -320,6 +358,20 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     nextHandTest();
   }
 
+  private void runHandNRPassed() {
+    checkState(sizeNonResCold >= sizeNRPassed);
+    if (handNRPassed == null) {
+      handNRPassed = handTest;
+    }
+    while ((sizeNonResCold - sizeNRPassed) > (maxResColdSize - Math.max(coldTarget, sizeResCold)) * 0.001) {
+      if (handNRPassed.status == Status.COLD_NON_RES && !handNRPassed.passed) {
+        handNRPassed.passed = true;
+        sizeNRPassed++;
+      }
+      handNRPassed = handNRPassed.prev;
+    }
+  }
+
   private void terminateTestPeriod(Node node) {
     if (!node.isInTest()) {
       return;
@@ -330,12 +382,12 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (node.isResidentCold()) {
       node.setStatus(Status.COLD_RES);
     } else {
+      if (node.passed) {
+        node.passed = false;
+        sizeNRPassed--;
+      }
       node.removeFromClock();
     }
-    // If a cold page is accessed during its test period, we increment coldTarget by 1. If a cold
-    // page passes its test period without a re-access, we decrement coldTarget by 1. Note the
-    // aforementioned cold pages include resident and non-resident cold pages.
-    coldTargetAdjust(node.marked ? +1 : -1);
   }
 
   // Make handCold points to the resident cold page with the largest recency.
@@ -388,6 +440,7 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     nextHandCold();
     nextHandHot();
     nextHandTest();
+//    runHandNRPassed();
   }
 
   private void coldTargetAdjust(int n) {
@@ -495,6 +548,8 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
 
   final class Node {
     final long key;
+    long createdVirtualTime;
+    boolean passed;
 
     Status status;
     Node prev;
@@ -502,10 +557,11 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
 
     boolean marked;
 
-    public Node(long key) {
+    public Node(long key, long createdVirtualTime) {
       this.key = key;
       prev = next = this;
       status = Status.OUT_OF_CLOCK;
+      this.createdVirtualTime = createdVirtualTime;
     }
 
     public void moveToHead(Status status) {
@@ -536,6 +592,9 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       }
       if (this == handTest) {
         handTest = handTest.prev;
+      }
+      if (this == handNRPassed) {
+        handNRPassed = handNRPassed.prev;
       }
       prev.next = next;
       next.prev = prev;

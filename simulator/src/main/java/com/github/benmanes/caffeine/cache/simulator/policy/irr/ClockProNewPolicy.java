@@ -112,7 +112,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     this.maximumSize = Ints.checkedCast(settings.maximumSize());
     this.maximumHotSize = (int) (maximumSize * 0.99);
     this.clockHead = this.clockHand = null;
-    this.decayThreshold = maximumSize;
+    this.decayThreshold = maximumHotSize / 4;
     this.nonResidentIrrThreshold = 8;
     this.decayMaxLife = 8;
     filter = new SimpleDecayBloomFilter(maximumSize * decayMaxLife, 0.001, decayMaxLife);
@@ -143,6 +143,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 
   @Override
   public void record(long key) {
+    if (policyStats.operationCount() % 100000 == 0) {
+      System.out.println((maximumSize - vHotTarget) * 100.0 / maximumSize);
+    }
     policyStats.recordOperation();
     Node node = data.get(key);
     if (node == null) {
@@ -169,7 +172,7 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     //
     // 보통의 케이스에서는 안해도 되는데, DS1에서 안하니까, hotTarget이 낮아져 버려서, scanLength가 길어져서 의미가 없어지네.
     // scanLength는 vHotTarget과 별개로 제어해야하나?
-    decayThreshold = maximumHotSize - sizeCold;
+//    decayThreshold = maximumHotSize - sizeCold;
 
     policyStats.recordMiss();
     if (sizeFree() > maximumSize) {
@@ -179,7 +182,14 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     } else {
       onFullMiss(node);
     }
+
+    if (policyStats.operationCount() - prevOps > maximumSize / 10) {
+      updateHotTarget();
+      prevOps = policyStats.operationCount();
+    }
   }
+
+  long prevOps;
 
   /** Records a miss when the hot set is not full. */
   private void onHotWarmupMiss(Node node) {
@@ -202,19 +212,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     decayNode.status = Status.DECAY;
     decayNode.linkTo(clockHand.next);
     nonResidentIrrThreshold--;
-  }
-
-  private void updateScanLength() {
-    int prevScanLength = scanLengthLimit;
-    if (sizeHot > vHotTarget) {
-      if (scanLengthLimit < 2) {
-        scanLengthLimit++;
-      }
-    } else {
-      scanLengthLimit = 1;
-    }
-//    System.out.printf("Scan length has changed: %d -> %d.\n", prevScanLength, scanLengthLimit);
-//    System.out.println(vHotTarget);
   }
 
   private void recordHistory(long key) {
@@ -256,6 +253,29 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     clockHand = clockHand.prev;
   }
 
+  private double prevHitRate;
+  private int nextStep = 1;
+
+  private void updateHotTarget() {
+    double hitRate = policyStats.hitRate();
+    if (hitRate > prevHitRate) {
+      nextStep *= 2;
+    } else {
+      nextStep /= 2;
+      if (nextStep == 0) {
+        nextStep = 10;
+      }
+      nextStep = -nextStep;
+    }
+    vHotTarget += nextStep;
+    if (vHotTarget > maximumHotSize) {
+      vHotTarget = maximumHotSize;
+    } else if (vHotTarget < maximumSize - maximumHotSize) {
+      vHotTarget = maximumSize - maximumHotSize;
+    }
+    prevHitRate = hitRate;
+  }
+
   /** Records a miss when the hot and cold set are full. */
   private void onFullMiss(Node node) {
     checkState(node.status == Status.OUT_OF_CLOCK);
@@ -280,11 +300,15 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 //      if (vHotTarget > (maximumSize - maximumHotSize)) {
 //        vHotTarget--;
 //      }
-      if (freshness >= decayMaxLife) {
-        if (vHotTarget > (maximumSize - maximumHotSize)) {
-          vHotTarget--;
-        }
-      }
+//      if (freshness >= decayMaxLife - 1) {
+//        if (vHotTarget > (maximumSize - maximumHotSize)) {
+//          vHotTarget--;
+//        }
+//      } else {
+//        if (vHotTarget < maximumHotSize) {
+//          vHotTarget++;
+//        }
+//      }
       onNonResidentFullMiss(node);
     } else {
       onOutOfClockFullMiss(node);
@@ -322,13 +346,12 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     Node node = clockHand;
     if (node.isCold()) {
       if (node.marked) {
-        node.count++;
         if (node.isShortIrr()) {
           if (sizeHot >= vHotTarget) {
             scanHot();
           }
-//          if (sizeHot < vHotTarget) {
-          if (sizeHot < maximumHotSize) {
+          if (sizeHot < vHotTarget) {
+//          if (sizeHot < maximumHotSize) {
             moveToHead(node);
             node.setStatus(Status.HOT);
           } else {
@@ -381,9 +404,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
 //            if (vHotTarget > maximumHotSize) {
 //              vHotTarget = maximumHotSize;
 //            }
-            vHotTarget++;
+//            vHotTarget++;
 
-//            vHotTarget += Math.max(1, maximumSize / (sizeDemoted + 1));
+//            vHotTarget += Math.max(1, maximumSize / 2 / (sizeDemoted + 1));
 //            if (vHotTarget > maximumHotSize) {
 //              vHotTarget = maximumHotSize;
 //            }
@@ -392,22 +415,15 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
           node.setStatus(Status.COLD_SHORT_IRR);
         }
       } else {
-        if (node.count != 0) {
-          node.count /= 2;
-          moveToHead(node);
-          node.setStatus(Status.COLD_SHORT_IRR);
-        } else {
-          if (node.isShortIrr()) {
-            recordHistory(node.key);
-          }
-          remove(node);
+        if (node.isShortIrr()) {
+          recordHistory(node.key);
         }
+        remove(node);
       }
     } else {
       if (node.marked) {
         moveToHead(node);
         node.setStatus(Status.HOT);
-        node.count++;
       } else {
         nextHand();
       }
@@ -415,17 +431,9 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
   }
 
   private void scanHot() {
-    updateScanLength();
-
-    // scan을 바로 쫓아가는게 의미가 있을까?
-//    scanLengthLimit = 1;
-//    while (sizeHot >= vHotTarget && clockTail() != clockHand) {
-      int scanned = 0;
+    while (sizeHot >= vHotTarget && clockTail() != clockHand) {
       for (Node node = clockTail(); node != clockHand; node = node.prev) {
         checkState(node.isHot() || node.status == Status.DECAY);
-        if (sizeHot <= maximumSize - maximumHotSize || scanned > scanLengthLimit) {
-          break;
-        }
 
         if (node.status == Status.DECAY) {
           nonResidentIrrThreshold++;
@@ -435,18 +443,15 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
           continue;
         }
 
-        scanned++;
         if (node.marked) {
-          node.count++;
           moveToHead(node);
           node.setStatus(Status.HOT);
         } else {
-          node.count /= 2;
           moveToHead(node);
           node.setStatus(Status.COLD_LONG_IRR);
         }
       }
-//    }
+    }
   }
 
   /** Prints out the internal state of the policy. */
@@ -470,7 +475,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
     Status status;
     Node prev;
     Node next;
-    int count;
 
     boolean marked;
 
@@ -478,7 +482,6 @@ public final class ClockProNewPolicy implements KeyOnlyPolicy {
       this.key = key;
       prev = next = this;
       status = Status.OUT_OF_CLOCK;
-      count = 0;
     }
 
     public void linkTo(Node node) {

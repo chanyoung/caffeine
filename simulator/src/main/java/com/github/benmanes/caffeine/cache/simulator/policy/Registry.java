@@ -197,7 +197,7 @@ public final class Registry {
 
     register(LirsPolicy.class, LirsPolicy::new);
     register(ClockProPolicy.class, ClockProPolicy::new);
-    register(ClockProPlusPolicy.class, ClockProPlusPolicy::new);
+    registerMany(ClockProPlusPolicy.class, ClockProPlusPolicy::policies);
     register(ClockProNewPolicy.class, ClockProNewPolicy::new);
     register(ClockProTestPolicy.class, ClockProTestPolicy::new);
 

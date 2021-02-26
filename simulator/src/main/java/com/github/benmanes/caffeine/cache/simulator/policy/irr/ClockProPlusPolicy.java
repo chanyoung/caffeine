@@ -16,8 +16,10 @@
 package com.github.benmanes.caffeine.cache.simulator.policy.irr;
 
 import static com.google.common.base.Preconditions.checkState;
+import static java.util.stream.Collectors.toSet;
 
 import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
 import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
 import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
@@ -27,6 +29,9 @@ import com.typesafe.config.Config;
 
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+
+import java.util.List;
+import java.util.Set;
 
 /**
  * The ClockProPlus algorithm. This algorithm differs from ClockPro by adjusting the coldTarget
@@ -90,6 +95,7 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
   private final int maxNonResSize;
+  private final int nineninepercent;
 
   private int sizeHot;
   private int sizeResCold;
@@ -109,24 +115,31 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
   // Enable to print out the internal state
   static final boolean debug = false;
 
-  public ClockProPlusPolicy(Config config) {
-    ClockProPlusSettings settings = new ClockProPlusSettings(config);
+  public ClockProPlusPolicy(ClockProPlusSettings settings, double percentMaxCold) {
     this.maxSize = Ints.checkedCast(settings.maximumSize());
     this.maxNonResSize = (int) (maxSize * settings.nonResidentMultiplier());
     this.minResColdSize = (int) (maxSize * settings.percentMinCold());
     if (minResColdSize < settings.lowerBoundCold()) {
       minResColdSize = settings.lowerBoundCold();
     }
-    this.maxResColdSize = (int) (maxSize * settings.percentMaxCold());
+    this.maxResColdSize = (int) (maxSize * percentMaxCold);
     if (maxResColdSize > maxSize - minResColdSize) {
       maxResColdSize = maxSize - minResColdSize;
     }
-    this.policyStats = new PolicyStats(name());
+    this.policyStats = new PolicyStats(name() + " (max-res-cold: %d%%)", (int) (100 * percentMaxCold));
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = minResColdSize;
+    this.coldTarget = maxResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
+    this.nineninepercent = (int) (maxSize * 0.99);
     checkState(minResColdSize <= maxResColdSize);
+  }
+
+  public static Set<Policy> policies(Config config) {
+    ClockProPlusSettings settings = new ClockProPlusSettings(config);
+    return settings.percentMaxCold().stream()
+        .map(percentMaxCold -> new ClockProPlusPolicy(settings, percentMaxCold))
+        .collect(toSet());
   }
 
   @Override
@@ -172,7 +185,7 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-    if (sizeFree > minResColdSize) {
+    if (sizeFree > nineninepercent) {
       onHotWarmupMiss(node);
     } else if (sizeFree > 0) {
       onColdWarmupMiss(node);
@@ -530,7 +543,7 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     checkState(sizeRecentlyDemoted == this.sizeDemoted);
     checkState(sizeHot + sizeResCold == maxSize - sizeFree);
     checkState(sizeResCold + sizeFree >= minResColdSize);
-    checkState(sizeResCold <= maxResColdSize);
+//    checkState(sizeResCold <= maxResColdSize);
     checkState(sizeNonResCold <= maxNonResSize);
   }
 
@@ -671,8 +684,8 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     public double percentMinCold() {
       return config().getDouble("clockproplus.percent-min-resident-cold");
     }
-    public double percentMaxCold() {
-      return config().getDouble("clockproplus.percent-max-resident-cold");
+    public List<Double> percentMaxCold() {
+      return config().getDoubleList("clockproplus.percent-max-resident-cold");
     }
     public double nonResidentMultiplier() {
       return config().getDouble("clockproplus.non-resident-multiplier");
