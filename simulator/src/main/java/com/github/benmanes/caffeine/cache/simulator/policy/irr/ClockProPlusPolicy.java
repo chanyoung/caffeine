@@ -95,7 +95,6 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
   private final int maxNonResSize;
-  private final int nineninepercent;
 
   private int sizeHot;
   private int sizeResCold;
@@ -128,10 +127,9 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     }
     this.policyStats = new PolicyStats(name() + " (max-res-cold: %d%%)", (int) (100 * percentMaxCold));
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = maxResColdSize;
+    this.coldTarget = minResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
-    this.nineninepercent = (int) (maxSize * 0.99);
     checkState(minResColdSize <= maxResColdSize);
   }
 
@@ -149,8 +147,8 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
 
   @Override
   public void finished() {
-    validateStatus();
-    validateClockStructure();
+//    validateStatus();
+//    validateClockStructure();
     if (debug) {
       printClock();
     }
@@ -185,19 +183,12 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-    if (sizeFree > nineninepercent) {
-      onHotWarmupMiss(node);
-    } else if (sizeFree > 0) {
+    if (sizeFree > 0) {
       onColdWarmupMiss(node);
     } else {
       onFullMiss(node);
     }
     organizeHands();
-  }
-
-  /** Records a miss when the hot set is not full. */
-  private void onHotWarmupMiss(Node node) {
-    node.moveToHead(Status.HOT);
   }
 
   /** Records a miss when the cold set is not full. */
@@ -543,7 +534,7 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
     checkState(sizeRecentlyDemoted == this.sizeDemoted);
     checkState(sizeHot + sizeResCold == maxSize - sizeFree);
     checkState(sizeResCold + sizeFree >= minResColdSize);
-//    checkState(sizeResCold <= maxResColdSize);
+    checkState(sizeResCold <= maxResColdSize);
     checkState(sizeNonResCold <= maxNonResSize);
   }
 
@@ -598,6 +589,10 @@ public final class ClockProPlusPolicy implements KeyOnlyPolicy {
       }
       setStatus(status);
       listHead = this;
+
+      if (handCold == null && this.isResidentCold()) {
+        handCold = this;
+      }
     }
 
     public void removeFromClock() {

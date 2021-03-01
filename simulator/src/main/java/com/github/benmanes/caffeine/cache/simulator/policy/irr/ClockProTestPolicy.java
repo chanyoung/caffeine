@@ -105,9 +105,13 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     if (maxResColdSize > maxSize - minResColdSize) {
       maxResColdSize = maxSize - minResColdSize;
     }
+
+    this.minResColdSize = 0;
+    this.maxResColdSize = maxSize;
+
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = maxResColdSize;
+//    this.coldTarget = maxResColdSize;
     this.coldTarget = minResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
@@ -154,12 +158,32 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     }
   }
 
-  int lessThan1IRR = 0;
+  int lessThan1IRR = 1;
+  int moreThan1IRR = 1;
+  long irr;
+  long avgIrr;
 
   private void stat() {
     System.out.println("Less than 1 IRR count: " + lessThan1IRR);
+    System.out.println("More than 1 IRR count: " + moreThan1IRR);
 
-    lessThan1IRR /= 2;
+    if (lessThan1IRR > 0) {
+      irr = irr / lessThan1IRR;
+    }
+    avgIrr = (avgIrr + irr) / 2;
+    System.out.println("Irr      : " + irr);
+    irr = 0;
+    System.out.println("Irr (avg): " + avgIrr);
+
+    coldTarget = (int) avgIrr;
+    if (coldTarget < minResColdSize) {
+      coldTarget = minResColdSize;
+    } else if (coldTarget > maxResColdSize) {
+      coldTarget = maxResColdSize;
+    }
+
+    lessThan1IRR = 0;
+    moreThan1IRR = 0;
   }
 
   private void onHit(Node node) {
@@ -172,8 +196,8 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-//    if (sizeFree > maxResColdSize) {
-    if (sizeFree > minResColdSize) {
+    if (sizeFree > maxResColdSize) {
+//    if (sizeFree > minResColdSize) {
       onHotWarmupMiss(node);
     } else if (sizeFree > 0) {
       onColdWarmupMiss(node);
@@ -217,11 +241,12 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
     // Adjust cold target.
 //    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize - coldTarget) {
 //    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize + maxResColdSize * policyStats.hitRate()) {
-//    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize) { // + maxResColdSize * policyStats.hitRate()) {
-//      coldTargetAdjust(+1);
-//    } else {
-//      coldTargetAdjust(-1);
-//    }
+    if (policyStats.operationCount() - node.createdVirtualTime <= maxResColdSize) { // + maxResColdSize * policyStats.hitRate()) {
+      irr += (policyStats.operationCount() - node.createdVirtualTime);
+      lessThan1IRR++;
+    } else {
+      moreThan1IRR++;
+    }
 //    if (node.passed) {
 //      coldTargetAdjust(-1);
 //      sizeNRPassed--;
@@ -281,12 +306,17 @@ public final class ClockProTestPolicy implements KeyOnlyPolicy {
       // there are no status change as well as HAND actions. Its reference bit is reset, and we
       // move it to the list head.
       if (handCold.isInTest()) {
+        if (policyStats.operationCount() - handCold.createdVirtualTime <= maxResColdSize) { // + maxResColdSize * policyStats.hitRate()) {
+          irr += (policyStats.operationCount() - handCold.createdVirtualTime);
+          lessThan1IRR++;
+        }
         if (canPromote(handCold)) {
           handCold.moveToHead(Status.HOT);
         } else {
           handCold.moveToHead(Status.COLD_RES_IN_TEST);
         }
       } else {
+        handCold.createdVirtualTime = policyStats.operationCount();
         handCold.moveToHead(Status.COLD_RES_IN_TEST);
 //        coldTargetAdjust(-1);
       }

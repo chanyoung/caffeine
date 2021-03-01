@@ -105,7 +105,7 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
     }
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.coldTarget = maxResColdSize;
+    this.coldTarget = minResColdSize;
     this.listHead = this.handHot = this.handCold = this.handTest = null;
     this.sizeFree = maxSize;
     checkState(minResColdSize <= maxResColdSize);
@@ -118,11 +118,13 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
 
   @Override
   public void finished() {
-    validateStatus();
-    validateClockStructure();
+//    validateStatus();
+//    validateClockStructure();
     if (debug) {
       printClock();
     }
+//    System.out.println(coldTarget);
+//    System.out.println("nr: " + nr + " / rm: " + rm + " / nrCreated: " + nrCreated);
   }
 
   @Override
@@ -154,19 +156,12 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
     // reaches maxSize - minResColdSize. After that, COLD_RES_IN_TEST status is given to any blocks
     // that are accessed for the first time.
     policyStats.recordMiss();
-    if (sizeFree > maxResColdSize) {
-      onHotWarmupMiss(node);
-    } else if (sizeFree > 0) {
+    if (sizeFree > 0) {
       onColdWarmupMiss(node);
     } else {
       onFullMiss(node);
     }
     organizeHands();
-  }
-
-  /** Records a miss when the hot set is not full. */
-  private void onHotWarmupMiss(Node node) {
-    node.moveToHead(Status.HOT);
   }
 
   /** Records a miss when the cold set is not full. */
@@ -523,6 +518,10 @@ public final class ClockProPolicy implements KeyOnlyPolicy {
       }
       setStatus(status);
       listHead = this;
+
+      if (handCold == null && this.isResidentCold()) {
+        handCold = this;
+      }
     }
 
     public void removeFromClock() {

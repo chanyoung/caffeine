@@ -1,0 +1,462 @@
+/*
+ * Copyright 2015 Ben Manes. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.github.benmanes.caffeine.cache.simulator.policy.irr;
+
+import com.github.benmanes.caffeine.cache.simulator.BasicSettings;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.KeyOnlyPolicy;
+import com.github.benmanes.caffeine.cache.simulator.policy.Policy.PolicySpec;
+import com.github.benmanes.caffeine.cache.simulator.policy.PolicyStats;
+import com.google.common.base.MoreObjects;
+import com.google.common.primitives.Ints;
+import com.typesafe.config.Config;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+
+import static com.google.common.base.Preconditions.checkState;
+
+/**
+ * The ClockPro algorithm. This algorithm differs from LIRS by replacing the LRU stacks with Clock
+ * (Second Chance) policy. This allows cache hits to be performed concurrently at the cost of a
+ * global lock on a miss and a worst case O(n) eviction when the queue is scanned.
+ * <p>
+ * ClockPro uses three hands that scan the queue. The hot hand points to the largest recency, the
+ * cold hand to the cold entry furthest from the hot hand, and the test hand to the last cold entry
+ * in the test period. This policy is adaptive by adjusting the percentage of hot and cold entries
+ * that may reside in the cache. It uses non-resident (ghost) entries to retain additional history,
+ * which are removed during the test hand's scan. The algorithm is explained by the authors in
+ * <a href="http://www.ece.eng.wayne.edu/~sjiang/pubs/papers/jiang05_CLOCK-Pro.pdf">CLOCK-Pro: An
+ * Effective Improvement of the CLOCK Replacement</a> and
+ * <a href="http://www.slideshare.net/huliang64/clockpro">Clock-Pro: An Effective Replacement in OS
+ * Kernel</a>.
+ *
+ * @author ben.manes@gmail.com (Ben Manes)
+ * @author park910113@gmail.com (Chanyoung Park)
+ */
+@PolicySpec(name = "irr.ClockProR")
+public final class ClockProRPolicy implements KeyOnlyPolicy {
+  private final Long2ObjectMap<Node> data;
+  private final PolicyStats policyStats;
+
+  private Node handHot;
+  private Node handCold;
+  private Node handNR;
+  private Node handNRRand;
+
+  // Maximum number of resident pages (hot + resident cold)
+  private final int maxSize;
+  private final int maxNonResSize;
+
+  private int sizeHot;
+  private int sizeCold;
+  private int sizeNR;
+
+  // Target number of resident cold pages (adaptive):
+  //  - increases when test page gets a hit
+  //  - decreases when test page is removed
+  private int coldTarget;
+
+  // Enable to print out the internal state
+  static final boolean debug = false;
+
+  public ClockProRPolicy(Config config) {
+    ClockProSettings settings = new ClockProSettings(config);
+    this.maxSize = Ints.checkedCast(settings.maximumSize());
+    this.maxNonResSize = (int) (maxSize * settings.nonResidentMultiplier());
+    this.policyStats = new PolicyStats(name());
+    this.data = new Long2ObjectOpenHashMap<>();
+    this.handHot = this.handCold = this.handNR = this.handNRRand = null;
+    this.sizeHot = this.sizeCold = this.sizeNR = 0;
+    this.coldTarget = 0;
+  }
+
+  @Override
+  public PolicyStats stats() {
+    return policyStats;
+  }
+
+  @Override
+  public void finished() {
+    if (debug) {
+      printClock();
+    }
+    int cold = (int) data.values().stream()
+      .filter(node -> node.status == Status.COLD)
+      .count();
+    int hot = (int) data.values().stream()
+      .filter(node -> node.status == Status.HOT)
+      .count();
+    int nonResident = (int) data.values().stream()
+      .filter(node -> node.status == Status.NR)
+      .count();
+
+    checkState(cold == sizeCold,
+      "Active: expected %s but was %s", sizeCold, cold);
+    checkState(hot == sizeHot,
+      "Inactive: expected %s but was %s", sizeHot, hot);
+    checkState(nonResident == sizeNR,
+      "NonResident: expected %s but was %s", sizeNR, nonResident);
+    checkState(data.size() == (cold + hot + nonResident));
+    checkState(cold + hot <= maxSize);
+    checkState(nonResident <= maxNonResSize);
+  }
+
+  private long currentVirtualTime() {
+    return policyStats.missCount();
+  }
+
+  @Override
+  public void record(long key) {
+    policyStats.recordOperation();
+    Node node = data.get(key);
+    if (node == null) {
+      onMiss(key);
+    } else if (node.status == Status.HOT || node.status == Status.COLD) {
+      onHit(node);
+    } else if (node.status == Status.NR) {
+      onNonResidentMiss(node);
+    } else {
+      throw new IllegalStateException();
+    }
+  }
+
+  private void onHit(Node node) {
+    policyStats.recordHit();
+    node.marked = true;
+  }
+
+  private void onMiss(long key) {
+    policyStats.recordMiss();
+    Node node = new Node(key, currentVirtualTime());
+    data.put(key, node);
+    if (sizeCold + sizeHot >= maxSize) {
+      evict();
+    }
+    appendToCold(node);
+    node.setStatus(Status.COLD);
+    prune();
+  }
+
+  private void prune() {
+    while (handNR != null && !handNR.observedEarlier(handHot)) {
+      runHandNR();
+    }
+  }
+
+  private void onNonResidentMiss(Node node) {
+    policyStats.recordMiss();
+    evict();
+    if (node == handNR) {
+      if (handNR.next == handNR) {
+        handNR = null;
+      } else {
+        handNR = handNR.next;
+      }
+    }
+    if (canPromote(node)) {
+      if (data.get(node.key) == null) {
+        data.put(node.key, node);
+      }
+      node.accessObservedTime = currentVirtualTime();
+      appendToHot(node);
+      node.setStatus(Status.HOT);
+    } else {
+      if (data.get(node.key) == null) {
+        data.put(node.key, node);
+      }
+      node.accessObservedTime = currentVirtualTime();
+      appendToCold(node);
+      node.setStatus(Status.COLD);
+    }
+  }
+
+  private void appendToCold(Node node) {
+    node.removeFromClock();
+    if (handCold == null) {
+      handCold = node;
+    } else {
+      node.link(handCold);
+    }
+    node.setStatus(Status.COLD);
+  }
+
+  private void appendToHot(Node node) {
+    node.removeFromClock();
+    if (handHot == null) {
+      handHot = node;
+    } else {
+      node.link(handHot);
+    }
+    node.setStatus(Status.HOT);
+  }
+
+  private void appendToNR(Node node) {
+    node.removeFromClock();
+    if (handNR == null) {
+      handNR = node;
+    } else {
+      node.link(handNR);
+    }
+    node.setStatus(Status.NR);
+  }
+
+  private void evict() {
+    checkState(sizeCold + sizeHot <= maxSize);
+    policyStats.recordEviction();
+    while (sizeCold + sizeHot == maxSize) {
+      runHandCold();
+    }
+  }
+
+  private boolean canPromote(Node candidate) {
+    if (!(candidate.status == Status.COLD || candidate.status == Status.NR)) {
+      return false;
+    }
+    coldTargetAdjust(+1);
+    while (sizeHot > 0 && sizeHot >= maxSize - coldTarget) {
+      if (!candidate.observedEarlier(handHot)) {
+        return false;
+      }
+      // Failed to demote a hot node. Reject the promotion.
+      if (!runHandHot(candidate.accessObservedTime)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private void runHandCold() {
+    checkState(handCold.status == Status.COLD);
+    if (handCold.marked) {
+      if (handCold.observedEarlier(handHot)) {
+        if (canPromote(handCold)) {
+          Node node = handCold;
+          if (handCold.next == handCold) {
+            handCold = null;
+          } else {
+            handCold = handCold.next;
+          }
+          node.accessObservedTime = currentVirtualTime();
+          appendToHot(node);
+        } else {
+          handCold.accessObservedTime = currentVirtualTime();
+          handCold.marked = false;
+          handCold = handCold.next;
+        }
+      } else {
+        handCold.accessObservedTime = currentVirtualTime();
+        handCold.marked = false;
+        handCold = handCold.next;
+      }
+    } else {
+      Node node = handCold;
+      if (handCold.next == handCold) {
+        handCold = null;
+      } else {
+        handCold = handCold.next;
+      }
+      if (handHot == null || node.observedEarlier(handHot)) {
+        appendToNR(node);
+      } else {
+        node.removeFromClock();
+        data.remove(node.key);
+      }
+      while (sizeNR > maxNonResSize) {
+        runHandNR();
+      }
+    }
+  }
+
+  private boolean runHandHot(long virtualTime) {
+    checkState(handHot.status == Status.HOT);
+    while (handHot.accessObservedTime <= virtualTime) {
+      if (handHot.marked) {
+        handHot.accessObservedTime = currentVirtualTime();
+        handHot.marked = false;
+        handHot = handHot.next;
+      } else {
+        Node node = handHot;
+        if (handHot.next == handHot) {
+          handHot = null;
+        } else {
+          handHot = handHot.next;
+        }
+        appendToCold(node);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private void runHandNR() {
+    Node node = handNR;
+    if (handNR.next == handNR) {
+      handNR = null;
+    } else {
+      handNR = handNR.next;
+    }
+    node.removeFromClock();
+    data.remove(node.key);
+    coldTargetAdjust(-1);
+  }
+
+  private void coldTargetAdjust(int n) {
+    coldTarget += n;
+    if (coldTarget < 0) {
+      coldTarget = 0;
+    } else if (coldTarget > maxSize) {
+      coldTarget = maxSize;
+    }
+  }
+
+  /** Prints out the internal state of the policy. */
+  private void printClock() {
+    if (handCold != null) {
+      System.out.println("** CLOCK-Pro list COLD HEAD (large recency) **");
+      System.out.println(handCold.toString());
+      for (Node n = handCold.next; n != handCold; n = n.next) {
+        System.out.println(n.toString());
+      }
+      System.out.println("** CLOCK-Pro list COLD TAIL (small recency) **");
+      System.out.println("");
+    }
+    if (handHot != null) {
+      System.out.println("** CLOCK-Pro list HOT HEAD (large recency) **");
+      System.out.println(handHot.toString());
+      for (Node n = handHot.next; n != handHot; n = n.next) {
+        System.out.println(n.toString());
+      }
+      System.out.println("** CLOCK-Pro list HOT TAIL (small recency) **");
+      System.out.println("");
+    }
+    if (handNR != null) {
+      System.out.println("** CLOCK-Pro list NR HEAD (large recency) **");
+      System.out.println(handNR.toString());
+      for (Node n = handNR.next; n != handNR; n = n.next) {
+        System.out.println(n.toString());
+      }
+      System.out.println("** CLOCK-Pro list NR TAIL (small recency) **");
+    }
+  }
+
+  // +----- Status ------+- Resident -+- In Test -+
+  // |               HOT |       TRUE |     FALSE |
+  // |              COLD |       TRUE |     FALSE |
+  // |      COLD_IN_TEST |       TRUE |      TRUE |
+  // |                NR |      FALSE |      TRUE |
+  // +-------------------+------------+-----------+
+  enum Status {
+    HOT, COLD, NR, OUT_OF_CLOCK,
+  }
+
+  final class Node {
+    final long key;
+    long accessObservedTime;
+
+    Status status;
+    Node prev;
+    Node next;
+
+    boolean marked;
+
+    public Node(long key, long accessObservedTime) {
+      this.key = key;
+      prev = next = this;
+      this.accessObservedTime = accessObservedTime;
+      this.status = Status.OUT_OF_CLOCK;
+    }
+
+    public void unlink() {
+      prev.next = next;
+      next.prev = prev;
+      prev = next = this;
+    }
+
+    public void link(Node node) {
+      next = node;
+      prev = node.prev;
+      prev.next = this;
+      next.prev = this;
+    }
+
+    public boolean observedEarlier(Node node) {
+      if (node != null && this.accessObservedTime <= node.accessObservedTime) {
+        return false;
+      }
+      return true;
+    }
+
+    public void removeFromClock() {
+      checkState(handCold != this);
+      checkState(handHot != this);
+      checkState(handNR != this);
+      checkState(handNRRand != this);
+      this.unlink();
+      marked = false;
+      setStatus(Status.OUT_OF_CLOCK);
+    }
+
+    public void setStatus(Status status) {
+      if (this.status == Status.COLD) { sizeCold--; }
+      if (this.status == Status.NR) { sizeNR--; }
+      if (this.status == Status.HOT) { sizeHot--; }
+      this.status = status;
+      if (this.status == Status.COLD) { sizeCold++; }
+      if (this.status == Status.NR) { sizeNR++; }
+      if (this.status == Status.HOT) { sizeHot++; }
+    }
+
+    @Override
+    public String toString() {
+      StringBuilder sb = new StringBuilder(MoreObjects.toStringHelper(this)
+          .add("key", key)
+          .add("marked", marked)
+          .add("type", status)
+          .add("time", accessObservedTime)
+          .toString());
+      if (this == handHot) {
+        sb.append(" <--[ HAND_HOT ]");
+      }
+      if (this == handCold) {
+        sb.append(" <--[ HAND_COLD ]");
+      }
+      if (this == handNR) {
+        sb.append(" <--[ HAND_NR ]");
+      }
+      if (this == handNRRand) {
+        sb.append(" <--[ HAND_NR_RAND ]");
+      }
+      return sb.toString();
+    }
+  }
+
+  static final class ClockProSettings extends BasicSettings {
+    public ClockProSettings(Config config) {
+      super(config);
+    }
+    public int lowerBoundCold() {
+      return config().getInt("clockpro.lower-bound-resident-cold");
+    }
+    public double percentMinCold() {
+      return config().getDouble("clockpro.percent-min-resident-cold");
+    }
+    public double percentMaxCold() {
+      return config().getDouble("clockpro.percent-max-resident-cold");
+    }
+    public double nonResidentMultiplier() {
+      return config().getDouble("clockpro.non-resident-multiplier");
+    }
+  }
+}
