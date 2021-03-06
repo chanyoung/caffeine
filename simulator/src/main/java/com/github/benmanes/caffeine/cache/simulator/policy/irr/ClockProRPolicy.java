@@ -68,6 +68,8 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   //  - decreases when test page is removed
   private int coldTarget;
 
+  private long targetHotSpeed;
+
   // Enable to print out the internal state
   static final boolean debug = false;
 
@@ -80,6 +82,8 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     this.handHot = this.handCold = this.handNR = this.handNRRand = null;
     this.sizeHot = this.sizeCold = this.sizeNR = 0;
     this.coldTarget = 0;
+
+    this.targetHotSpeed = maxSize * 5;
   }
 
   @Override
@@ -114,7 +118,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private long currentVirtualTime() {
-    return policyStats.missCount();
+//    return policyStats.missCount();
+//    return policyStats.missCount() + policyStats.hitCount();
+    return policyStats.missCount() + activation;
   }
 
   @Override
@@ -130,6 +136,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     } else {
       throw new IllegalStateException();
     }
+
+    if (policyStats.operationCount() % 100000 == 0) {
+      System.out.println("hotSpeed: " + (double) targetHotSpeed * 100 / maxSize
+        + ", sizeCold: " + (double) sizeCold * 100 / maxSize);
+    }
   }
 
   private void onHit(Node node) {
@@ -144,8 +155,13 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     if (sizeCold + sizeHot >= maxSize) {
       evict();
     }
-    appendToCold(node);
-    node.setStatus(Status.COLD);
+    if (sizeHot + sizeCold != 0) {
+      appendToCold(node);
+      node.setStatus(Status.COLD);
+    } else {
+      appendToHot(node);
+      node.setStatus(Status.HOT);
+    }
     prune();
   }
 
@@ -158,11 +174,24 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   private void onNonResidentMiss(Node node) {
     policyStats.recordMiss();
     evict();
+    if (sizeCold == 0) {
+      checkState(node.status == Status.NR);
+      return;
+    }
     if (node == handNR) {
       if (handNR.next == handNR) {
         handNR = null;
       } else {
         handNR = handNR.next;
+      }
+    }
+//    coldTargetAdjust(+1);
+    if (node.status == Status.NR) {
+//      if (currentVirtualTime() - node.accessObservedTime < sizeHot) {
+//      if ((currentVirtualTime() - node.accessObservedTime) * (1.0 + policyStats.hitRate()) < sizeHot) {
+      if (currentVirtualTime() - node.accessObservedTime < sizeHot) {
+//        targetHotSpeedAdjust(-Math.max(1, maxSize / 10000));
+        targetHotSpeedAdjust(-1);
       }
     }
     if (canPromote(node)) {
@@ -192,6 +221,8 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     node.setStatus(Status.COLD);
   }
 
+  long activation = 0;
+
   private void appendToHot(Node node) {
     node.removeFromClock();
     if (handHot == null) {
@@ -200,6 +231,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       node.link(handHot);
     }
     node.setStatus(Status.HOT);
+    activation++;
   }
 
   private void appendToNR(Node node) {
@@ -216,7 +248,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     checkState(sizeCold + sizeHot <= maxSize);
     policyStats.recordEviction();
     while (sizeCold + sizeHot == maxSize) {
-      runHandCold();
+      if (handCold != null) {
+        runHandCold();
+      } else {
+        runHandHot();
+      }
     }
   }
 
@@ -224,17 +260,18 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     if (!(candidate.status == Status.COLD || candidate.status == Status.NR)) {
       return false;
     }
-    coldTargetAdjust(+1);
-    while (sizeHot > 0 && sizeHot >= maxSize - coldTarget) {
-      if (!candidate.observedEarlier(handHot)) {
-        return false;
-      }
-      // Failed to demote a hot node. Reject the promotion.
-      if (!runHandHot(candidate.accessObservedTime)) {
-        return false;
-      }
-    }
-    return true;
+    runHandHot();
+    return candidate.observedEarlier(handHot) && sizeHot < maxSize * 99 / 100;
+//    while (sizeHot > 0 && sizeHot >= maxSize - coldTarget) {
+//      if (!candidate.observedEarlier(handHot)) {
+//        return false;
+//      }
+//       Failed to demote a hot node. Reject the promotion.
+//      if (!runHandHot(candidate.accessObservedTime)) {
+//        return false;
+//      }
+//    }
+//    return true;
   }
 
   private void runHandCold() {
@@ -259,6 +296,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
         handCold.accessObservedTime = currentVirtualTime();
         handCold.marked = false;
         handCold = handCold.next;
+//          coldTargetAdjust(-1);
+//        targetHotSpeedAdjust(+Math.max(1, maxSize / 10000));
+        targetHotSpeedAdjust(Math.max(1, sizeHot / 100));
       }
     } else {
       Node node = handCold;
@@ -275,6 +315,28 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       }
       while (sizeNR > maxNonResSize) {
         runHandNR();
+      }
+    }
+  }
+
+  private void runHandHot() {
+//    while (handHot != null && (currentVirtualTime() - handHot.accessObservedTime > targetHotSpeed || handHot.marked )) {
+    while (handHot != null && (currentVirtualTime() - handHot.accessObservedTime > targetHotSpeed || handHot.marked )) {
+      if (handHot.marked) {
+        handHot.accessObservedTime = currentVirtualTime();
+        handHot.marked = false;
+        handHot = handHot.next;
+      } else {
+        if (handHot.observedEarlier(handCold)) {
+          return;
+        }
+        Node node = handHot;
+        if (handHot.next == handHot) {
+          handHot = null;
+        } else {
+          handHot = handHot.next;
+        }
+        appendToCold(node);
       }
     }
   }
@@ -309,7 +371,15 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     }
     node.removeFromClock();
     data.remove(node.key);
-    coldTargetAdjust(-1);
+  }
+
+  private void targetHotSpeedAdjust(long n) {
+    targetHotSpeed += n;
+    if (targetHotSpeed < maxSize / 10) {
+      targetHotSpeed = maxSize / 10;
+    } else if (targetHotSpeed > maxSize * 10) {
+      targetHotSpeed = maxSize * 10;
+    }
   }
 
   private void coldTargetAdjust(int n) {
