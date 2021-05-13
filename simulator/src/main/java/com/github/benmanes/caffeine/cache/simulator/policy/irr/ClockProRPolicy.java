@@ -151,14 +151,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   private void onNonResidentMiss(Node node) {
     policyStats.recordMiss();
-    if (node == handNR) {
-      if (handNR.next == handNR) {
-        handNR = null;
-      } else {
-        handNR = handNR.next;
-      }
-    }
-    node.removeFromClock();
+    removeFromClock(node);
     sizeNR--;
     if (canPromote(node)) {
       appendToHot(node);
@@ -198,6 +191,29 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     node.status = Status.NR;
   }
 
+  private void removeFromClock(Node node) {
+    if (handCold == node) {
+      if (handCold != handCold.next) {
+        handCold = handCold.next;
+      } else {
+        handCold = null;
+      }
+    } else if (handHot == node) {
+      if (handHot != handHot.next) {
+        handHot = handHot.next;
+      } else {
+        handHot = null;
+      }
+    } else if (handNR == node) {
+      if (handNR != handNR.next) {
+        handNR = handNR.next;
+      } else {
+        handNR = null;
+      }
+    }
+    node.unlink();
+  }
+
   private void evict() {
     policyStats.recordEviction();
     while (maxSize < sizeCold + sizeHot) {
@@ -231,16 +247,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       if (inTestPeriod(handCold)) {
         if (canPromote(handCold)) {
           Node node = handCold;
-          if (handCold.next == handCold) {
-            handCold = null;
-          } else {
-            handCold = handCold.next;
-          }
-          node.removeFromClock();
-          node.age = currentVirtualTime();
+          removeFromClock(node);
           appendToHot(node);
           sizeCold--;
           sizeHot++;
+          node.age = currentVirtualTime();
         } else {
           handCold.age = currentVirtualTime();
           handCold.marked = false;
@@ -253,12 +264,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       }
     } else {
       Node node = handCold;
-      if (handCold.next == handCold) {
-        handCold = null;
-      } else {
-        handCold = handCold.next;
-      }
-      node.removeFromClock();
+      removeFromClock(node);
       sizeCold--;
       if (inTestPeriod(node)) {
         appendToNR(node);
@@ -281,12 +287,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
         handHot = handHot.next;
       } else {
         Node node = handHot;
-        if (handHot.next == handHot) {
-          handHot = null;
-        } else {
-          handHot = handHot.next;
-        }
-        node.removeFromClock();
+        removeFromClock(node);
         appendToCold(node);
         sizeHot--;
         sizeCold++;
@@ -298,15 +299,10 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   private void runHandNR() {
     Node node = handNR;
-    if (handNR.next == handNR) {
-      handNR = null;
-    } else {
-      handNR = handNR.next;
-    }
-    node.removeFromClock();
+    removeFromClock(node);
     data.remove(node.key);
-    adjustColdTarget(-1);
     sizeNR--;
+    adjustColdTarget(-1);
   }
 
   private void adjustColdTarget(int n) {
@@ -359,7 +355,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   // |                NR |      FALSE |      TRUE |
   // +-------------------+------------+-----------+
   enum Status {
-    HOT, COLD, NR, OUT_OF_CLOCK,
+    HOT, COLD, NR,
   }
 
   final class Node {
@@ -376,7 +372,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       this.key = key;
       prev = next = this;
       this.age = age;
-      this.status = Status.OUT_OF_CLOCK;
+      this.status = Status.COLD;
     }
 
     public void unlink() {
@@ -390,13 +386,6 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       prev = node.prev;
       prev.next = this;
       next.prev = this;
-    }
-
-    public void removeFromClock() {
-      checkState(handCold != this);
-      checkState(handHot != this);
-      checkState(handNR != this);
-      this.unlink();
     }
 
     @Override
