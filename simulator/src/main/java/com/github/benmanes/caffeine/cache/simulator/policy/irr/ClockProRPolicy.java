@@ -138,12 +138,8 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     policyStats.recordMiss();
     Node node = new Node(key, currentVirtualTime());
     data.put(key, node);
-    if (sizeCold + sizeHot >= maxSize) {
-      evict();
-    }
     appendToCold(node);
-    node.setStatus(Status.COLD);
-    prune();
+    evict();
   }
 
   private void prune() {
@@ -154,7 +150,6 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   private void onNonResidentMiss(Node node) {
     policyStats.recordMiss();
-    evict();
     if (node == handNR) {
       if (handNR.next == handNR) {
         handNR = null;
@@ -163,58 +158,54 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       }
     }
     if (canPromote(node)) {
-      if (data.get(node.key) == null) {
-        data.put(node.key, node);
-      }
-      node.age = currentVirtualTime();
       appendToHot(node);
-      node.setStatus(Status.HOT);
     } else {
-      if (data.get(node.key) == null) {
-        data.put(node.key, node);
-      }
-      node.age = currentVirtualTime();
       appendToCold(node);
-      node.setStatus(Status.COLD);
     }
+    node.age = currentVirtualTime();
+    evict();
   }
 
   private void appendToCold(Node node) {
     node.removeFromClock();
-    if (handCold == null) {
-      handCold = node;
-    } else {
+    if (handCold != null) {
       node.link(handCold);
+    } else {
+      handCold = node;
     }
     node.setStatus(Status.COLD);
   }
 
   private void appendToHot(Node node) {
     node.removeFromClock();
-    if (handHot == null) {
-      handHot = node;
-    } else {
+    if (handHot != null) {
       node.link(handHot);
+    } else {
+      handHot = node;
     }
     node.setStatus(Status.HOT);
   }
 
   private void appendToNR(Node node) {
     node.removeFromClock();
-    if (handNR == null) {
-      handNR = node;
-    } else {
+    if (handNR != null) {
       node.link(handNR);
+    } else {
+      handNR = node;
     }
     node.setStatus(Status.NR);
   }
 
   private void evict() {
-    checkState(sizeCold + sizeHot <= maxSize);
     policyStats.recordEviction();
-    while (sizeCold + sizeHot == maxSize) {
-      runHandCold();
+    while (maxSize < sizeCold + sizeHot) {
+      if (sizeCold > 0) {
+        runHandCold();
+      } else {
+        runHandHot(currentVirtualTime());
+      }
     }
+    prune();
   }
 
   private boolean canPromote(Node candidate) {
@@ -227,11 +218,8 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       if (!runHandHot(candidate.age)) {
         return false;
       }
-      if (!inTestPeriod(candidate)) {
-        return false;
-      }
     }
-    return true;
+    return inTestPeriod(candidate);
   }
 
   private void runHandCold() {
@@ -276,12 +264,12 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     }
   }
 
-  private boolean runHandHot(long virtualTime) {
+  private boolean runHandHot(long age) {
     checkState(handHot.status == Status.HOT);
-    while (handHot.age <= virtualTime) {
+    while (handHot.age <= age) {
       if (handHot.marked) {
-        handHot.age = currentVirtualTime();
         handHot.marked = false;
+        handHot.age = currentVirtualTime();
         handHot = handHot.next;
       } else {
         Node node = handHot;
@@ -319,10 +307,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private boolean inTestPeriod(Node node) {
-    if (handHot != null && node.age <= handHot.age) {
-      return false;
-    }
-    return true;
+    return handHot == null || node.age > handHot.age;
   }
 
   /** Prints out the internal state of the policy. */
