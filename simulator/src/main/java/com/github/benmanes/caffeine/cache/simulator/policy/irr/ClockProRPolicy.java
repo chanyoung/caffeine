@@ -53,11 +53,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   private Node handHot;
   private Node handCold;
   private Node handNR;
-  private Node handNRRand;
 
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
-  private final int maxNonResSize;
 
   private int sizeHot;
   private int sizeCold;
@@ -72,12 +70,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   static final boolean debug = false;
 
   public ClockProRPolicy(Config config) {
-    ClockProSettings settings = new ClockProSettings(config);
+    BasicSettings settings = new BasicSettings(config);
     this.maxSize = Ints.checkedCast(settings.maximumSize());
-    this.maxNonResSize = (int) (maxSize * settings.nonResidentMultiplier());
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.handHot = this.handCold = this.handNR = this.handNRRand = null;
+    this.handHot = this.handCold = this.handNR = null;
     this.sizeHot = this.sizeCold = this.sizeNR = 0;
     this.coldTarget = 0;
   }
@@ -110,7 +107,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       "NonResident: expected %s but was %s", sizeNR, nonResident);
     checkState(data.size() == (cold + hot + nonResident));
     checkState(cold + hot <= maxSize);
-    checkState(nonResident <= maxNonResSize);
+    checkState(nonResident <= maxSize);
   }
 
   private long currentVirtualTime() {
@@ -150,7 +147,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void prune() {
-    while (handNR != null && !handNR.observedEarlier(handHot)) {
+    while (handNR != null && !inTestPeriod(handNR)) {
       runHandNR();
     }
   }
@@ -169,14 +166,14 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       if (data.get(node.key) == null) {
         data.put(node.key, node);
       }
-      node.accessObservedTime = currentVirtualTime();
+      node.age = currentVirtualTime();
       appendToHot(node);
       node.setStatus(Status.HOT);
     } else {
       if (data.get(node.key) == null) {
         data.put(node.key, node);
       }
-      node.accessObservedTime = currentVirtualTime();
+      node.age = currentVirtualTime();
       appendToCold(node);
       node.setStatus(Status.COLD);
     }
@@ -221,16 +218,16 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private boolean canPromote(Node candidate) {
-    if (!(candidate.status == Status.COLD || candidate.status == Status.NR)) {
+    if (!inTestPeriod(candidate)) {
       return false;
     }
-    coldTargetAdjust(+1);
+    adjustColdTarget(+1);
     while (sizeHot > 0 && sizeHot >= maxSize - coldTarget) {
-      if (!candidate.observedEarlier(handHot)) {
+      // Failed to demote a hot node. Reject the promotion.
+      if (!runHandHot(candidate.age)) {
         return false;
       }
-      // Failed to demote a hot node. Reject the promotion.
-      if (!runHandHot(candidate.accessObservedTime)) {
+      if (!inTestPeriod(candidate)) {
         return false;
       }
     }
@@ -240,7 +237,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   private void runHandCold() {
     checkState(handCold.status == Status.COLD);
     if (handCold.marked) {
-      if (handCold.observedEarlier(handHot)) {
+      if (inTestPeriod(handCold)) {
         if (canPromote(handCold)) {
           Node node = handCold;
           if (handCold.next == handCold) {
@@ -248,15 +245,15 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
           } else {
             handCold = handCold.next;
           }
-          node.accessObservedTime = currentVirtualTime();
+          node.age = currentVirtualTime();
           appendToHot(node);
         } else {
-          handCold.accessObservedTime = currentVirtualTime();
+          handCold.age = currentVirtualTime();
           handCold.marked = false;
           handCold = handCold.next;
         }
       } else {
-        handCold.accessObservedTime = currentVirtualTime();
+        handCold.age = currentVirtualTime();
         handCold.marked = false;
         handCold = handCold.next;
       }
@@ -267,13 +264,13 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       } else {
         handCold = handCold.next;
       }
-      if (handHot == null || node.observedEarlier(handHot)) {
+      if (inTestPeriod(node)) {
         appendToNR(node);
       } else {
         node.removeFromClock();
         data.remove(node.key);
       }
-      while (sizeNR > maxNonResSize) {
+      while (sizeNR > maxSize) {
         runHandNR();
       }
     }
@@ -281,9 +278,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   private boolean runHandHot(long virtualTime) {
     checkState(handHot.status == Status.HOT);
-    while (handHot.accessObservedTime <= virtualTime) {
+    while (handHot.age <= virtualTime) {
       if (handHot.marked) {
-        handHot.accessObservedTime = currentVirtualTime();
+        handHot.age = currentVirtualTime();
         handHot.marked = false;
         handHot = handHot.next;
       } else {
@@ -309,16 +306,23 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     }
     node.removeFromClock();
     data.remove(node.key);
-    coldTargetAdjust(-1);
+    adjustColdTarget(-1);
   }
 
-  private void coldTargetAdjust(int n) {
+  private void adjustColdTarget(int n) {
     coldTarget += n;
     if (coldTarget < 0) {
       coldTarget = 0;
     } else if (coldTarget > maxSize) {
       coldTarget = maxSize;
     }
+  }
+
+  private boolean inTestPeriod(Node node) {
+    if (handHot != null && node.age <= handHot.age) {
+      return false;
+    }
+    return true;
   }
 
   /** Prints out the internal state of the policy. */
@@ -363,7 +367,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   final class Node {
     final long key;
-    long accessObservedTime;
+    long age;
 
     Status status;
     Node prev;
@@ -371,10 +375,10 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
     boolean marked;
 
-    public Node(long key, long accessObservedTime) {
+    public Node(long key, long age) {
       this.key = key;
       prev = next = this;
-      this.accessObservedTime = accessObservedTime;
+      this.age = age;
       this.status = Status.OUT_OF_CLOCK;
     }
 
@@ -391,18 +395,10 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       next.prev = this;
     }
 
-    public boolean observedEarlier(Node node) {
-      if (node != null && this.accessObservedTime <= node.accessObservedTime) {
-        return false;
-      }
-      return true;
-    }
-
     public void removeFromClock() {
       checkState(handCold != this);
       checkState(handHot != this);
       checkState(handNR != this);
-      checkState(handNRRand != this);
       this.unlink();
       marked = false;
       setStatus(Status.OUT_OF_CLOCK);
@@ -424,7 +420,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
           .add("key", key)
           .add("marked", marked)
           .add("type", status)
-          .add("time", accessObservedTime)
+          .add("age", age)
           .toString());
       if (this == handHot) {
         sb.append(" <--[ HAND_HOT ]");
@@ -435,28 +431,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       if (this == handNR) {
         sb.append(" <--[ HAND_NR ]");
       }
-      if (this == handNRRand) {
-        sb.append(" <--[ HAND_NR_RAND ]");
-      }
       return sb.toString();
-    }
-  }
-
-  static final class ClockProSettings extends BasicSettings {
-    public ClockProSettings(Config config) {
-      super(config);
-    }
-    public int lowerBoundCold() {
-      return config().getInt("clockpro.lower-bound-resident-cold");
-    }
-    public double percentMinCold() {
-      return config().getDouble("clockpro.percent-min-resident-cold");
-    }
-    public double percentMaxCold() {
-      return config().getDouble("clockpro.percent-max-resident-cold");
-    }
-    public double nonResidentMultiplier() {
-      return config().getDouble("clockpro.non-resident-multiplier");
     }
   }
 }
