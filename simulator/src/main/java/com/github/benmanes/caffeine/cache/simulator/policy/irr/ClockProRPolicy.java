@@ -50,9 +50,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
 
-  private Node handHot;
-  private Node handCold;
-  private Node handNR;
+  private final Node headHot;
+  private final Node headCold;
+  private final Node headNonResident;
 
   // Maximum number of resident pages (hot + resident cold)
   private final int maxSize;
@@ -74,9 +74,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     this.maxSize = Ints.checkedCast(settings.maximumSize());
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.handHot = this.handCold = this.handNR = null;
     this.sizeHot = this.sizeCold = this.sizeNR = 0;
     this.coldTarget = 0;
+    this.headHot = new Node(Long.MIN_VALUE, -1);
+    this.headCold = new Node(Long.MIN_VALUE, -1);
+    this.headNonResident = new Node(Long.MIN_VALUE, -1);
   }
 
   @Override
@@ -110,7 +112,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     checkState(nonResident <= maxSize);
   }
 
-  private long currentVirtualTime() {
+  private long currentAge() {
     return policyStats.missCount();
   }
 
@@ -136,82 +138,35 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
 
   private void onMiss(long key) {
     policyStats.recordMiss();
-    Node node = new Node(key, currentVirtualTime());
+    Node node = new Node(key, currentAge());
+    node.status = Status.COLD;
+    node.link(headCold);
     data.put(key, node);
-    appendToCold(node);
     sizeCold++;
     evict();
   }
 
   private void prune() {
-    while (handNR != null && !inTestPeriod(handNR)) {
+    while (sizeNR > 0 && !inTestPeriod(headNonResident.prev)) {
       runHandNR();
     }
   }
 
   private void onNonResidentMiss(Node node) {
     policyStats.recordMiss();
-    removeFromClock(node);
+    node.unlink();
     sizeNR--;
     if (canPromote(node)) {
-      appendToHot(node);
+      node.status = Status.HOT;
+      node.link(headHot);
       sizeHot++;
     } else {
-      appendToCold(node);
+      node.status = Status.COLD;
+      node.link(headCold);
       sizeCold++;
     }
-    node.age = currentVirtualTime();
+    node.age = currentAge();
     evict();
-  }
-
-  private void appendToCold(Node node) {
-    if (handCold != null) {
-      node.link(handCold);
-    } else {
-      handCold = node;
-    }
-    node.status = Status.COLD;
-  }
-
-  private void appendToHot(Node node) {
-    if (handHot != null) {
-      node.link(handHot);
-    } else {
-      handHot = node;
-    }
-    node.status = Status.HOT;
-  }
-
-  private void appendToNR(Node node) {
-    if (handNR != null) {
-      node.link(handNR);
-    } else {
-      handNR = node;
-    }
-    node.status = Status.NR;
-  }
-
-  private void removeFromClock(Node node) {
-    if (handCold == node) {
-      if (handCold != handCold.next) {
-        handCold = handCold.next;
-      } else {
-        handCold = null;
-      }
-    } else if (handHot == node) {
-      if (handHot != handHot.next) {
-        handHot = handHot.next;
-      } else {
-        handHot = null;
-      }
-    } else if (handNR == node) {
-      if (handNR != handNR.next) {
-        handNR = handNR.next;
-      } else {
-        handNR = null;
-      }
-    }
-    node.unlink();
   }
 
   private void evict() {
@@ -220,7 +175,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       if (sizeCold > 0) {
         runHandCold();
       } else {
-        runHandHot(currentVirtualTime());
+        runHandHot(currentAge());
       }
     }
     prune();
@@ -241,36 +196,28 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void runHandCold() {
-    checkState(handCold.status == Status.COLD);
-    if (handCold.marked) {
-      handCold.marked = false;
-      if (inTestPeriod(handCold)) {
-        if (canPromote(handCold)) {
-          Node node = handCold;
-          removeFromClock(node);
-          appendToHot(node);
-          sizeCold--;
-          sizeHot++;
-          node.age = currentVirtualTime();
-        } else {
-          handCold.age = currentVirtualTime();
-          handCold.marked = false;
-          handCold = handCold.next;
-        }
+    Node victim = headCold.prev;
+    victim.unlink();
+    if (victim.marked) {
+      victim.marked = false;
+      if (canPromote(victim)) {
+        victim.age = currentAge();
+        victim.status = Status.HOT;
+        victim.link(headHot);
+        sizeCold--;
+        sizeHot++;
       } else {
-        handCold.age = currentVirtualTime();
-        handCold.marked = false;
-        handCold = handCold.next;
+        victim.age = currentAge();
+        victim.link(headCold);
       }
     } else {
-      Node node = handCold;
-      removeFromClock(node);
       sizeCold--;
-      if (inTestPeriod(node)) {
-        appendToNR(node);
+      if (inTestPeriod(victim)) {
+        victim.status = Status.NR;
+        victim.link(headNonResident);
         sizeNR++;
       } else {
-        data.remove(node.key);
+        data.remove(victim.key);
       }
       while (sizeNR > maxSize) {
         runHandNR();
@@ -279,16 +226,19 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private boolean runHandHot(long age) {
-    checkState(handHot.status == Status.HOT);
-    while (handHot.age <= age) {
-      if (handHot.marked) {
-        handHot.marked = false;
-        handHot.age = currentVirtualTime();
-        handHot = handHot.next;
+    while (sizeHot > 0) {
+      Node victim = headHot.prev;
+      if (victim.age > age) {
+        break;
+      }
+      victim.unlink();
+      if (victim.marked) {
+        victim.marked = false;
+        victim.age = currentAge();
+        victim.link(headHot);
       } else {
-        Node node = handHot;
-        removeFromClock(node);
-        appendToCold(node);
+        victim.status = Status.COLD;
+        victim.link(headCold);
         sizeHot--;
         sizeCold++;
         return true;
@@ -298,11 +248,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void runHandNR() {
-    Node node = handNR;
-    removeFromClock(node);
-    data.remove(node.key);
-    sizeNR--;
+    Node victim = headNonResident.prev;
+    victim.unlink();
+    data.remove(victim.key);
     adjustColdTarget(-1);
+    sizeNR--;
   }
 
   private void adjustColdTarget(int n) {
@@ -315,45 +265,36 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private boolean inTestPeriod(Node node) {
-    return handHot == null || node.age > handHot.age;
+    return sizeHot == 0 || node.age > headHot.prev.age;
   }
 
   /** Prints out the internal state of the policy. */
   private void printClock() {
-    if (handCold != null) {
-      System.out.println("** CLOCK-Pro list COLD HEAD (large recency) **");
-      System.out.println(handCold.toString());
-      for (Node n = handCold.next; n != handCold; n = n.next) {
+    if (sizeCold > 0) {
+      System.out.println("** CLOCK-Pro list COLD HEAD (small recency) **");
+      for (Node n = headCold.next; n != headCold; n = n.next) {
         System.out.println(n.toString());
       }
-      System.out.println("** CLOCK-Pro list COLD TAIL (small recency) **");
+      System.out.println("** CLOCK-Pro list COLD TAIL (large recency) **");
       System.out.println("");
     }
-    if (handHot != null) {
-      System.out.println("** CLOCK-Pro list HOT HEAD (large recency) **");
-      System.out.println(handHot.toString());
-      for (Node n = handHot.next; n != handHot; n = n.next) {
+    if (sizeHot > 0) {
+      System.out.println("** CLOCK-Pro list HOT HEAD (small recency) **");
+      for (Node n = headHot.next; n != headHot; n = n.next) {
         System.out.println(n.toString());
       }
-      System.out.println("** CLOCK-Pro list HOT TAIL (small recency) **");
+      System.out.println("** CLOCK-Pro list HOT TAIL (large recency) **");
       System.out.println("");
     }
-    if (handNR != null) {
-      System.out.println("** CLOCK-Pro list NR HEAD (large recency) **");
-      System.out.println(handNR.toString());
-      for (Node n = handNR.next; n != handNR; n = n.next) {
+    if (sizeNR > 0) {
+      System.out.println("** CLOCK-Pro list NR HEAD (small recency) **");
+      for (Node n = headNonResident.next; n != headNonResident; n = n.next) {
         System.out.println(n.toString());
       }
-      System.out.println("** CLOCK-Pro list NR TAIL (small recency) **");
+      System.out.println("** CLOCK-Pro list NR TAIL (large recency) **");
     }
   }
 
-  // +----- Status ------+- Resident -+- In Test -+
-  // |               HOT |       TRUE |     FALSE |
-  // |              COLD |       TRUE |     FALSE |
-  // |      COLD_IN_TEST |       TRUE |      TRUE |
-  // |                NR |      FALSE |      TRUE |
-  // +-------------------+------------+-----------+
   enum Status {
     HOT, COLD, NR,
   }
@@ -382,30 +323,20 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     }
 
     public void link(Node node) {
-      next = node;
-      prev = node.prev;
+      prev = node;
+      next = node.next;
       prev.next = this;
       next.prev = this;
     }
 
     @Override
     public String toString() {
-      StringBuilder sb = new StringBuilder(MoreObjects.toStringHelper(this)
+      return MoreObjects.toStringHelper(this)
           .add("key", key)
           .add("marked", marked)
           .add("type", status)
           .add("age", age)
-          .toString());
-      if (this == handHot) {
-        sb.append(" <--[ HAND_HOT ]");
-      }
-      if (this == handCold) {
-        sb.append(" <--[ HAND_COLD ]");
-      }
-      if (this == handNR) {
-        sb.append(" <--[ HAND_NR ]");
-      }
-      return sb.toString();
+          .toString();
     }
   }
 }
