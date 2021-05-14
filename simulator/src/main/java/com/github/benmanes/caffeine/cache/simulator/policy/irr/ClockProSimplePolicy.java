@@ -42,11 +42,15 @@ import static com.google.common.base.Preconditions.checkState;
  * <a href="http://www.slideshare.net/huliang64/clockpro">Clock-Pro: An Effective Replacement in OS
  * Kernel</a>.
  *
+ * This implementation works exactly like ClockPro, but pursues the simplicity of the code.
+ * It divides a single list of ClockPro into three lists: hot, cold, and non-resident.
+ * For maintaining a test period of each entries, it uses epoch.
+ *
  * @author ben.manes@gmail.com (Ben Manes)
  * @author park910113@gmail.com (Chanyoung Park)
  */
-@PolicySpec(name = "irr.ClockProR")
-public final class ClockProRPolicy implements KeyOnlyPolicy {
+@PolicySpec(name = "irr.ClockProSimple")
+public final class ClockProSimplePolicy implements KeyOnlyPolicy {
   private final Long2ObjectMap<Node> data;
   private final PolicyStats policyStats;
 
@@ -60,7 +64,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   private int sizeHot;
   private int sizeCold;
   private int sizeNR;
-  private int reaccessCount;
+  private int reaccessedCount;
 
   // Target number of resident cold pages (adaptive):
   //  - increases when test page gets a hit
@@ -70,17 +74,14 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   // Enable to print out the internal state
   static final boolean debug = false;
 
-  public ClockProRPolicy(Config config) {
+  public ClockProSimplePolicy(Config config) {
     BasicSettings settings = new BasicSettings(config);
     this.maxSize = Ints.checkedCast(settings.maximumSize());
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.sizeHot = this.sizeCold = this.sizeNR = 0;
-    this.coldTarget = 0;
     this.headHot = new Node(Long.MIN_VALUE, -1);
     this.headCold = new Node(Long.MIN_VALUE, -1);
     this.headNonResident = new Node(Long.MIN_VALUE, -1);
-    this.reaccessCount = 0;
   }
 
   @Override
@@ -104,9 +105,9 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       .count();
 
     checkState(cold == sizeCold,
-      "Active: expected %s but was %s", sizeCold, cold);
+      "Cold: expected %s but was %s", sizeCold, cold);
     checkState(hot == sizeHot,
-      "Inactive: expected %s but was %s", sizeHot, hot);
+      "Hot: expected %s but was %s", sizeHot, hot);
     checkState(nonResident == sizeNR,
       "NonResident: expected %s but was %s", sizeNR, nonResident);
     checkState(data.size() == (cold + hot + nonResident));
@@ -118,12 +119,11 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   // or when an existing entry is re-accessed and moved to the head. The epoch is used to determine whether
   // an entry's test period has expired or not.
   private long epoch() {
-    return policyStats.missCount() + reaccessCount;
+    return policyStats.missCount() + reaccessedCount;
   }
 
   @Override
   public void record(long key) {
-    policyStats.recordOperation();
     Node node = data.get(key);
     if (node == null) {
       onMiss(key);
@@ -137,11 +137,13 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void onHit(Node node) {
+    policyStats.recordOperation();
     policyStats.recordHit();
     node.marked = true;
   }
 
   private void onMiss(long key) {
+    policyStats.recordOperation();
     policyStats.recordMiss();
     Node node = new Node(key, epoch());
     node.status = Status.COLD;
@@ -159,6 +161,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void onNonResidentMiss(Node node) {
+    policyStats.recordOperation();
     policyStats.recordMiss();
     node.unlink();
     sizeNR--;
@@ -192,7 +195,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
     if (!inTestPeriod(candidate)) {
       return false;
     }
-    // The candidate cold page is re-accessed during its test period, so we increment coldTarget.
+    // The candidate cold entry is re-accessed during its test period, so we increment coldTarget.
     adjustColdTarget(+1);
     while (sizeHot > 0 && sizeHot >= maxSize - coldTarget) {
       // Failed to demote a hot node. Reject the promotion.
@@ -205,6 +208,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void scanCold() {
+    policyStats.recordOperation();
     Node victim = headCold.prev;
     victim.unlink();
     if (victim.marked) {
@@ -222,7 +226,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       } else {
         victim.link(headCold);
       }
-      reaccessCount++;
+      reaccessedCount++;
       victim.epoch = epoch();
     } else {
       // If the reference bit of the cold entry is unset, we replace the cold entry for a free space. If the replaced
@@ -247,6 +251,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   // ScanHot demotes a hot entry between the oldest hot entry's epoch and the given epoch.
   // If the demotion was successful it returns true, otherwise it returns false.
   private boolean scanHot(long epoch) {
+    policyStats.recordOperation();
     while (sizeHot > 0) {
       Node victim = headHot.prev;
       if (victim.epoch > epoch) {
@@ -254,14 +259,15 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
       }
       victim.unlink();
       // If the reference bit of the hot entry is unset, we can simply change its status and link to the head of cold
-      // list. However, if the bit is set, which indicates the page has been re-accessed, we spare this page, reset its
-      // reference bit and keep it as a hot page. This is because the actual access time of the hot page could be
-      // earlier than the cold page. Then we move the hand forward and do the same on the hot pages with their bits set
-      // until the hand encounters a hot page with a reference bit of zero. Then the hot page turns into a cold page.
+      // list. However, if the bit is set, which indicates the entry has been re-accessed, we spare this entry, reset
+      // its reference bit and keep it as a hot entry. This is because the actual access time of the hot entry could be
+      // earlier than the cold entry. Then we move the hand forward and do the same on the hot entries with their bits
+      // set until the hand encounters a hot entry with a reference bit of zero. Then the hot entry turns into a cold
+      // page.
       if (victim.marked) {
         victim.marked = false;
         victim.link(headHot);
-        reaccessCount++;
+        reaccessedCount++;
         victim.epoch = epoch();
       } else {
         victim.status = Status.COLD;
@@ -275,6 +281,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
   }
 
   private void scanNonResident() {
+    policyStats.recordOperation();
     // We terminate the test period of the non-resident cold page, and also remove it from the clock. Because the cold
     // page has used up its test period without a re-access and has no chance to turn into a hot page with its next
     // access.
@@ -366,7 +373,7 @@ public final class ClockProRPolicy implements KeyOnlyPolicy {
           .add("key", key)
           .add("marked", marked)
           .add("type", status)
-          .add("age", epoch)
+          .add("epoch", epoch)
           .toString();
     }
   }
