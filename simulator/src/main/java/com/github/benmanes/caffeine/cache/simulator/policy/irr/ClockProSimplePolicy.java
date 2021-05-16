@@ -64,7 +64,11 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
   private int sizeHot;
   private int sizeCold;
   private int sizeNR;
-  private int reaccessedCount;
+
+  // To know the order of entries, epoch is used. The epoch is incremented by 1 when a new entry is inserted,
+  // or when an existing entry has been re-accessed and moved to the head. The epoch is used to determine whether
+  // an entry's test period has expired or not.
+  private long epoch;
 
   // Target number of resident cold pages (adaptive):
   //  - increases when test page gets a hit
@@ -79,9 +83,10 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
     this.maxSize = Ints.checkedCast(settings.maximumSize());
     this.policyStats = new PolicyStats(name());
     this.data = new Long2ObjectOpenHashMap<>();
-    this.headHot = new Node(Long.MIN_VALUE, -1);
-    this.headCold = new Node(Long.MIN_VALUE, -1);
-    this.headNonResident = new Node(Long.MIN_VALUE, -1);
+    this.headHot = new Node(Long.MIN_VALUE, Long.MIN_VALUE);
+    this.headCold = new Node(Long.MIN_VALUE, Long.MIN_VALUE);
+    this.headNonResident = new Node(Long.MIN_VALUE, Long.MIN_VALUE);
+    this.epoch = Long.MIN_VALUE;
   }
 
   @Override
@@ -115,13 +120,6 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
     checkState(nonResident <= maxSize);
   }
 
-  // To know the order of entries, epoch is used. The epoch is incremented by 1 when a new entry is inserted,
-  // or when an existing entry is re-accessed and moved to the head. The epoch is used to determine whether
-  // an entry's test period has expired or not.
-  private long epoch() {
-    return policyStats.missCount() + reaccessedCount;
-  }
-
   @Override
   public void record(long key) {
     Node node = data.get(key);
@@ -145,7 +143,8 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
   private void onMiss(long key) {
     policyStats.recordOperation();
     policyStats.recordMiss();
-    Node node = new Node(key, epoch());
+    epoch++;
+    Node node = new Node(key, epoch);
     node.status = Status.COLD;
     node.link(headCold);
     data.put(key, node);
@@ -174,7 +173,7 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
       node.link(headCold);
       sizeCold++;
     }
-    node.epoch = epoch();
+    node.epoch = epoch;
     evict();
   }
 
@@ -184,7 +183,7 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
       if (sizeCold > 0) {
         scanCold();
       } else {
-        scanHot(epoch());
+        scanHot(epoch);
       }
     }
     prune();
@@ -226,8 +225,8 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
       } else {
         victim.link(headCold);
       }
-      reaccessedCount++;
-      victim.epoch = epoch();
+      epoch++;
+      victim.epoch = epoch;
     } else {
       // If the reference bit of the cold entry is unset, we replace the cold entry for a free space. If the replaced
       // cold entry is in its test period, then it will remain in the list as a non-resident cold entry until it runs
@@ -254,7 +253,7 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
     policyStats.recordOperation();
     while (sizeHot > 0) {
       Node victim = headHot.prev;
-      if (victim.epoch > epoch) {
+      if (newer(victim.epoch, epoch)) {
         break;
       }
       victim.unlink();
@@ -267,8 +266,8 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
       if (victim.marked) {
         victim.marked = false;
         victim.link(headHot);
-        reaccessedCount++;
-        victim.epoch = epoch();
+        epoch++;
+        victim.epoch = epoch;
       } else {
         victim.status = Status.COLD;
         victim.link(headCold);
@@ -303,9 +302,21 @@ public final class ClockProSimplePolicy implements KeyOnlyPolicy {
   }
 
   // Test period should be set as the largest recency of the hot entry. If an entry is
-  // older than the largest recency of the hot entry, the test period has expired.
+  // older than the largest recency of the hot entry, the test period has been expired.
   private boolean inTestPeriod(Node node) {
-    return sizeHot == 0 || node.epoch > headHot.prev.epoch;
+    return sizeHot == 0 || newer(node.epoch, headHot.prev.epoch);
+  }
+
+  // Newer returns true if x is newer epoch than y, otherwise return false. It makes the code safe from integer
+  // overflow. For this method to work, epoch data type must be a signed numeric type, and must be able to represent
+  // a number greater than the maximum number of cache entries * 2.
+  private boolean newer(long x, long y) {
+    if ((x ^ y) < 0 && epoch < 0) {
+      // If the signs of x and y are different and the current epoch is negative, the negative epoch is always newer.
+      return !(x > y);
+    } else {
+      return x > y;
+    }
   }
 
   /** Prints out the internal state of the policy. */
